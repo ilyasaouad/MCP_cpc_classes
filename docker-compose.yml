@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # MCP Server (TypeScript)
+  mcp-server:
+    build:
+      context: ./MCP_patent_classification
+      dockerfile: Dockerfile
+    ports:
+      - "3456:3456"
+    environment:
+      - LLM_MODEL=llama3.2
+      - PORT=3456
+      - SERPAPI_API_KEY=${SERPAPI_API_KEY}
+    networks:
+      - patent-network
+    restart: unless-stopped
+
+  # FastAPI Backend (Python)
+  fastapi:
+    build:
+      context: ./patent_cpc_fastapi
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_MODEL=llama3.2
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      # Mount CPC XML files (must be downloaded separately)
+      - ./patent_cpc_fastapi/app/cpc_classification/resources/cpc_scheme_2026:/app/app/cpc_classification/resources/cpc_scheme_2026
+    networks:
+      - patent-network
+    restart: unless-stopped
+    depends_on:
+      - mcp-server
+
+  # Streamlit Client (Python)
+  streamlit:
+    build:
+      context: ./cpc_client
+      dockerfile: Dockerfile
+    ports:
+      - "8502:8502"
+    environment:
+      - API_URL=http://fastapi:8000
+      - MCP_URL=http://mcp-server:3456
+    networks:
+      - patent-network
+    restart: unless-stopped
+    depends_on:
+      - fastapi
+
+networks:
+  patent-network:
+    driver: bridge

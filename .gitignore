@@ -1,0 +1,46 @@
+# General exclusions
+**/.DS_Store
+**/*.pyc
+**/Thumbs.db
+**/.vscode/
+**/.ruff_cache/
+
+# Python
+**/__pycache__/
+**/.venv/
+**/.env
+
+# Node.js
+**/node_modules/
+**/dist/
+
+# Logs
+**/*.log
+
+# Other projects in this directory (not part of the repo)
+/patent_application_anlayse_langgraph/
+/patent_document_analyse/
+
+# MCP_patent_classification exclusions
+/MCP_patent_classification/node_modules/
+/MCP_patent_classification/dist/
+/MCP_patent_classification/.env
+/MCP_patent_classification/*.log
+
+# patent_cpc_fastapi exclusions
+/patent_cpc_fastapi/.venv/
+/patent_cpc_fastapi/__pycache__/
+/patent_cpc_fastapi/app/__pycache__/
+/patent_cpc_fastapi/app/**/*.pyc
+/patent_cpc_fastapi/.ruff_cache/
+/patent_cpc_fastapi/.env
+/patent_cpc_fastapi/app/cpc_classification/resources/cpc_scheme_2026/*.xml
+/patent_cpc_fastapi/app/cpc_classification/resources/cpc_scheme_2026/*.json
+/patent_cpc_fastapi/app/cpc_classification/resources/chroma_db/
+/patent_cpc_fastapi/ollama_response.txt
+
+# cpc_client exclusions
+/cpc_client/.venv/
+/cpc_client/__pycache__/
+/cpc_client/.ruff_cache/
+/cpc_client/.env
