@@ -3,13 +3,21 @@ import os
 import re
 import math
 import json
-from typing import Dict, Any, Set, List, Tuple
+from typing import Dict, Any, Set, List, Tuple, Optional
 from collections import Counter
 
 from search_core.ollama_client import OllamaClient
 from .extracting_cpc import CPCExtractor
 from .cpc_xml_parser import CPCXMLParser
-from .prompts import label_claims, rerank_prompt
+from .knowledge_graph import CPCKnowledgeGraph
+from .prompts import (
+    label_claims,
+    domain_inference_prompt,
+    semantic_scoring_prompt,
+    validation_prompt_single,
+    reconciliation_prompt,
+    consistency_check_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +30,7 @@ def _resolve_xml_dir() -> str:
 
 def _normalize_word(word: str) -> str:
     """Normalize a word for matching: lowercase, strip punctuation, basic stemming."""
-    word = word.lower().strip(".,;:!?()[]{}")
-    # Basic stemming rules for CPC technical terms
+    word = word.lower().strip(".,;:!?()[]{}-")
     if word.endswith("ing") and len(word) > 5:
         word = word[:-3]
     elif word.endswith("ed") and len(word) > 4:
@@ -41,17 +48,13 @@ def _tokenize(text: str) -> Set[str]:
     return {_normalize_word(w) for w in words if len(w) > 2}
 
 
-# Expanded synonym mapping for CPC technical terms
+# Synonym mapping for CPC technical terms
 CPC_SYNONYMS = {
-    # Venting / Deaeration
     "venting": ["deaeration", "degassing", "air removal", "bleeding", "vent"],
     "bleeding": ["deaeration", "degassing", "venting", "air removal"],
-    "self-bleeding": ["deaeration", "self-venting", "auto-bleeding", "auto-venting"],
-    "air venting": ["deaeration", "degassing", "air removal"],
     "deaeration": ["venting", "degassing", "air removal", "bleeding"],
     "degassing": ["deaeration", "venting", "air removal"],
     "air removal": ["deaeration", "venting", "degassing"],
-    # Cooling / Thermal
     "cooling": [
         "temperature control",
         "heat removal",
@@ -59,49 +62,21 @@ CPC_SYNONYMS = {
         "coolant",
         "radiator",
     ],
-    "coolant": ["cooling", "heat transfer fluid", "thermal medium"],
-    "heat removal": ["cooling", "thermal management"],
     "thermal management": ["cooling", "heat removal", "temperature control"],
-    "radiator": ["heat exchanger", "cooling device"],
-    # Sealing
     "sealing": ["gasketing", "packing", "jointing", "seal"],
     "seal": ["sealing", "gasket", "packing"],
-    # Valves
     "valve": ["tap", "cock", "vent", "shut-off"],
-    "venting valve": ["bleed valve", "air valve", "deaeration valve"],
-    "bleed": ["vent", "deaerate", "air release"],
-    # Battery / Electrical
     "battery": ["accumulator", "cell", "electrochemical storage"],
-    "electric vehicle": ["ev", "battery vehicle", "electromobile"],
-    # Oil / Gas / Wellhead
     "wellhead": [
         "well head",
         "blowout preventer",
         "christmas tree",
         "wellhead assembly",
     ],
-    "tubing hanger": ["tubing support", "casing hanger", "production hanger"],
     "drilling": ["boring", "earth drilling", "well drilling"],
-    "oil well": ["petroleum well", "hydrocarbon well", "production well"],
-    "gas well": ["natural gas well", "petroleum well"],
-    "annulus": ["annular space", "annular void", "borehole annulus"],
-    "casing": ["well casing", "borehole lining"],
-    "downhole": ["subsurface", "down hole", "borehole"],
-    # Explosive / Cutting
     "explosive": ["charge", "detonation", "blast", "explosion"],
-    "explosive charge": ["shaped charge", "detonating charge", "blast charge"],
-    "shaped charge": ["explosive charge", "lined cavity charge", "hollow charge"],
     "cutter": ["cutting tool", "perforator", "radial cutter", "pipe cutter"],
-    "cutting": ["severing", "destroying", "perforating", "fracturing"],
-    "partial radial cutter": ["explosive cutter", "pipe cutter", "tubing cutter"],
-    # Well Completion / Workover
-    "well completion": ["completion", "wellbore completion", "tubing completion"],
-    "idling": ["abandoning", "plugging", "shutting in", "well idling"],
-    "accessory conduit": ["conduit", "tubing", "line", "cable"],
-    # Liquid / Fluid
-    "liquid": ["fluid", "coolant"],
-    "fluid": ["liquid", "coolant"],
-    # Device / Apparatus
+    "completion": ["wellbore completion", "tubing completion"],
     "device": ["apparatus", "equipment", "unit"],
     "apparatus": ["device", "equipment", "unit"],
 }
@@ -116,128 +91,65 @@ def _get_expanded_terms(term: str) -> Set[str]:
     """Get all variants of a term including synonyms."""
     terms = {term.lower()}
     words = term.lower().split()
-
-    # Add synonyms for each word
     for word in words:
         syns = _get_synonyms(word)
         for syn in syns:
-            # Replace the word with its synonym in the term
             for w in words:
                 variant = term.lower().replace(w, syn)
                 terms.add(variant)
-        terms.update(syns)
-
+            terms.add(syn)
     return terms
-
-
-def _is_system_first(system_context: str, core_function: str) -> bool:
-    """
-    Determine if this invention is application-specific equipment (system-first)
-    or a generic functional component (function-first).
-    """
-    system_context = system_context.lower()
-    core_function = core_function.lower()
-
-    # Strong system signals - these indicate the invention is specific equipment
-    strong_system_signals = [
-        "wellhead",
-        "tubing hanger",
-        "blowout preventer",
-        "christmas tree",
-        "drilling rig",
-        "drill bit",
-        "drill string",
-        "casing",
-        "downhole tool",
-        "explosive cutter",
-        "shaped charge",
-        "partial radial cutter",
-        "engine",
-        "motor",
-        "turbine",
-        "pump",
-        "battery pack",
-        "battery module",
-        "battery cell",
-        "reactor",
-        "distillation column",
-        "heat exchanger unit",
-        "transmission",
-        "gearbox",
-        "drivetrain",
-    ]
-
-    # Check if system context contains strong domain signals
-    for signal in strong_system_signals:
-        if signal in system_context:
-            return True
-
-    # If the system context describes a specific industry/application clearly
-    if any(
-        word in system_context
-        for word in ["oil", "gas", "petroleum", "hydrocarbon", "well"]
-    ):
-        if any(
-            word in system_context
-            for word in ["drilling", "production", "extraction", "completion"]
-        ):
-            return True
-
-    return False
 
 
 def _parse_llm_json(response) -> dict:
     """Parse JSON from LLM response with multiple fallback strategies."""
     if not response:
         return {}
-
-    # 1. Try parsing the whole thing first
     try:
         return json.loads(response)
     except Exception:
         pass
-
-    # 2. Strip markdown fences and try again
     cleaned = re.sub(r"^```(?:json)?\s*", "", response.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
         return json.loads(cleaned)
     except Exception:
         pass
-
-    # 3. Fallback: greedy regex
     match = re.search(r"\{.*\}", response, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except Exception:
             pass
-
     return {}
 
 
 class CPCClassifier:
     """
-    MAIN CPC CLASSIFICATION PIPELINE
+    IMPROVED CPC CLASSIFICATION PIPELINE
+    Addresses weaknesses W1-W8
     """
 
-    def __init__(self, model_name: str = "gpt-oss:120b-cloud"):
+    def __init__(
+        self,
+        model_name: str = "gpt-oss:120b-cloud",
+        knowledge_graph: Optional[CPCKnowledgeGraph] = None,
+    ):
         self.llm = OllamaClient(model_name=model_name)
         self.extractor = CPCExtractor(self.llm)
         self.xml_parser = CPCXMLParser(_resolve_xml_dir())
+        self.knowledge_graph = knowledge_graph
 
     def classify(self, text: str, claims: str = "") -> Dict[str, Any]:
 
         # ─────────────────────────────
-        # PHASE 1: LLM extraction
+        # PHASE 1: LLM extraction (improved)
         # ─────────────────────────────
-        # Split text into description and claims if claims not provided separately
         description = text
         labeled_claims = ""
         if claims:
             labeled_claims = label_claims(claims)
         elif "CLAIMS:" in text or "claims:" in text.lower():
-            # Try to auto-split if claims are embedded in text
             parts = re.split(r"CLAIMS:|claims:", text, flags=re.IGNORECASE, maxsplit=1)
             if len(parts) == 2:
                 description = parts[0].strip()
@@ -246,255 +158,132 @@ class CPCClassifier:
 
         phase1 = self.extractor.extract(description, labeled_claims)
 
-        cpc_classes = phase1.get("cpc_classes", [])
-        terms = phase1.get("essential_terms", phase1.get("terms", []))
-
-        system_context = phase1.get("system_context", "").lower()
-        core_function = phase1.get("core_function", "").lower()
-        strategy = phase1.get("classification_strategy", "").lower()
-
-        # Determine if system-first based on strategy or heuristics
-        is_system_first = "system-first" in strategy or _is_system_first(
-            system_context, core_function
-        )
-
         # ─────────────────────────────
-        # PHASE 1b: Extract Negative Signals from Phase 1
+        # PHASE 1b: Probabilistic domain inference (replaces hardcoded injection)
         # ─────────────────────────────
-        negative_signals = [s.lower() for s in phase1.get("negative_signals", [])]
-        negative_domains = [d.lower() for d in phase1.get("negative_domains", [])]
-        logger.info("Negative signals from Phase 1: %s", negative_signals)
-        logger.info("Negative domains from Phase 1: %s", negative_domains)
-
-        # ─────────────────────────────
-        # POST-PROCESSING: Smart class injection
-        # ─────────────────────────────
-        primary_injections = []
-        secondary_injections = []
-
-        # SYSTEM-FIRST: Domain classes take priority
-        if is_system_first:
-            # Oil/Gas/Drilling/Wellhead domain
-            if any(
-                word in system_context
-                for word in [
-                    "wellhead",
-                    "tubing hanger",
-                    "drilling",
-                    "oil well",
-                    "gas well",
-                    "hydrocarbon",
-                    "petroleum",
-                    "borehole",
-                    "downhole",
-                    "annulus",
-                ]
-            ):
-                if "E21B" not in cpc_classes:
-                    primary_injections.append("E21B")
-                    logger.info(
-                        "Post-processing: Injecting E21B as PRIMARY for wellhead/drilling system"
-                    )
-
-            # Well completion / workover / abandonment
-            if any(
-                word in system_context
-                for word in [
-                    "completion",
-                    "workover",
-                    "abandonment",
-                    "idling",
-                    "plugging",
-                    "well idling",
-                    "well completion",
-                ]
-            ) or any(
-                word in core_function
-                for word in [
-                    "complete",
-                    "workover",
-                    "abandon",
-                    "idle",
-                    "plug",
-                ]
-            ):
-                if "E21B43" not in cpc_classes and "E21B" not in cpc_classes:
-                    primary_injections.append("E21B43")
-                    logger.info(
-                        "Post-processing: Injecting E21B43 for well completion/abandonment"
-                    )
-
-            # Explosive cutting / perforation
-            if any(
-                word in core_function
-                for word in [
-                    "explosive",
-                    "charge",
-                    "detonate",
-                    "blast",
-                    "cut",
-                    "cutter",
-                    "sever",
-                    "destroy",
-                    "perforate",
-                ]
-            ) or any(
-                word in system_context
-                for word in [
-                    "explosive",
-                    "shaped charge",
-                    "detonation",
-                    "cutter",
-                    "cutting",
-                ]
-            ):
-                if "E21B29" not in cpc_classes and "E21B" not in cpc_classes:
-                    primary_injections.append("E21B29")
-                    logger.info(
-                        "Post-processing: Injecting E21B29 for explosive cutting/perforation"
-                    )
-
-            # Vehicle domain
-            if any(
-                word in system_context
-                for word in ["vehicle", "automotive", "car", "truck", "aircraft"]
-            ):
-                if "B60" not in cpc_classes and not any(
-                    c.startswith("B60") for c in cpc_classes
-                ):
-                    primary_injections.append("B60")
-                    logger.info(
-                        "Post-processing: Injecting B60 as PRIMARY for vehicle system"
-                    )
-
-        # FUNCTION-FIRST or secondary: Function classes
-        if any(
-            word in core_function
-            for word in [
-                "cool",
-                "cooling",
-                "heat removal",
-                "thermal management",
-                "temperature control",
-                "radiator",
-                "coolant",
-            ]
-        ):
-            if "F01P" not in cpc_classes:
-                if is_system_first:
-                    secondary_injections.append("F01P")
-                else:
-                    primary_injections.append("F01P")
-                logger.info("Post-processing: Injecting F01P for cooling function")
-
-        if any(
-            word in core_function
-            for word in ["seal", "sealing", "prevent leakage", "gasket", "packing"]
-        ):
-            if "F16J" not in cpc_classes:
-                if is_system_first and "E21B" in (primary_injections + cpc_classes):
-                    secondary_injections.append("F16J")
-                    logger.info(
-                        "Post-processing: Injecting F16J as SECONDARY for sealing in wellhead system"
-                    )
-                else:
-                    primary_injections.append("F16J")
-                    logger.info("Post-processing: Injecting F16J for sealing function")
-
-        if any(
-            word in core_function
-            for word in ["valve", "vent", "venting", "bleed", "tap", "cock"]
-        ):
-            if "F16K" not in cpc_classes:
-                if is_system_first and "E21B" in (primary_injections + cpc_classes):
-                    secondary_injections.append("F16K")
-                    logger.info(
-                        "Post-processing: Injecting F16K as SECONDARY for valve in wellhead system"
-                    )
-                else:
-                    primary_injections.append("F16K")
-                    logger.info(
-                        "Post-processing: Injecting F16K for valve/venting function"
-                    )
-
-        # Electrical/Battery domain (context-based)
-        if any(
-            word in system_context
-            for word in [
-                "electrical",
-                "battery",
-                "batteries",
-                "electric vehicle",
-                "electric motor",
-                "ev ",
-                "powertrain",
-            ]
-        ):
-            if "B60L" not in cpc_classes:
-                if is_system_first:
-                    primary_injections.append("B60L")
-                else:
-                    secondary_injections.append("B60L")
-                logger.info(
-                    "Post-processing: Injecting B60L for electrical system context"
-                )
-
-        # Combine injections: primary first, then existing classes, then secondary
-        if primary_injections:
-            cpc_classes = primary_injections + [
-                c for c in cpc_classes if c not in primary_injections
-            ]
-        if secondary_injections:
-            cpc_classes = cpc_classes + [
-                c for c in secondary_injections if c not in cpc_classes
-            ]
-
-        logger.info("Post-processing: Final class list: %s", cpc_classes)
-
-        # Remove F25 if F01P is present (F01P is for machine cooling, F25 is refrigeration)
-        if "F25" in cpc_classes and "F01P" in cpc_classes:
-            cpc_classes = [c for c in cpc_classes if c != "F25"]
-            logger.info(
-                "Post-processing: Removed F25 in favor of F01P for machine cooling"
+        domain_probs = {}
+        try:
+            domain_prompt = domain_inference_prompt(phase1)
+            domain_response = self.llm.chat(
+                system_prompt="You are estimating CPC domain relevance probabilities.",
+                user_message=domain_prompt,
+                temperature=0.1,
+                max_tokens=2000,
             )
+            domain_data = _parse_llm_json(domain_response)
+            for dp in domain_data.get("domain_probabilities", []):
+                cls = dp.get("class", "")
+                prob = dp.get("probability", 0.0)
+                if cls and prob > 0.3:  # Only keep domains with >30% probability
+                    domain_probs[cls] = prob
+            logger.info("Phase 1b: Domain probabilities: %s", domain_probs)
+        except Exception as e:
+            logger.warning("Phase 1b domain inference failed: %s", e)
 
-        logger.info("Phase 1: System context: %s", system_context)
-        logger.info("Phase 1: Core function: %s", core_function)
-        logger.info(
-            "Phase 1: Strategy: %s",
-            "system-first" if is_system_first else "function-first",
+        # Get base classes from LLM hypotheses or fallback
+        class_hypotheses = phase1.get("class_hypotheses", [])
+        cpc_classes = [
+            h.get("class", "") for h in class_hypotheses if h.get("confidence", 0) > 0.3
+        ]
+
+        # Add high-probability domains from inference
+        for cls, prob in domain_probs.items():
+            if prob > 0.5 and cls not in cpc_classes:
+                cpc_classes.append(cls)
+                logger.info("Phase 1b: Adding %s (probability %.2f)", cls, prob)
+
+        if not cpc_classes:
+            # Fallback to old cpc_classes if available
+            cpc_classes = phase1.get("cpc_classes", [])
+
+        # ─────────────────────────────
+        # Extract terms with section-aware importance
+        # ─────────────────────────────
+        terms = phase1.get(
+            "terms", phase1.get("essential_terms", phase1.get("terms", []))
         )
-
-        # Extract terms with importance (claims terms already have 2x weight from extractor)
         term_importance = {}
         for t in terms:
             if isinstance(t, dict):
                 term = t.get("term", "").lower()
                 importance = t.get("importance", 5)
+                source = t.get("source_section", "unknown")
+                # Apply section weight
+                section_weight = {
+                    "claims": 1.2,
+                    "summary": 1.0,
+                    "detailed_description": 0.9,
+                    "abstract": 0.6,
+                    "background": 0.2,
+                }.get(source, 0.5)
+                adjusted = min(round(importance * section_weight), 10)
                 if term and len(term) > 3:
-                    term_importance[term] = importance
+                    term_importance[term] = max(term_importance.get(term, 0), adjusted)
             else:
                 term = str(t).lower()
                 if term and len(term) > 3:
                     term_importance[term] = 5
 
-        # ─────────────────────────────
-        # PHASE 2: XML expansion + improved scoring with negative signals
-        # ─────────────────────────────
-        logger.info("Phase 2: Expanding classes %s", cpc_classes)
+        system_context = phase1.get("system_context", "").lower()
+        core_function = phase1.get("core_function", "").lower()
+        strategy = phase1.get("classification_strategy", "").lower()
 
+        # ─────────────────────────────
+        # PHASE 2a: Knowledge Graph Query (NEW)
+        # ─────────────────────────────
+        graph_classes = []
+        if self.knowledge_graph and self.knowledge_graph.embeddings:
+            logger.info("Phase 2a: Querying knowledge graph")
+            try:
+                # Combine patent text for semantic search
+                patent_text_for_search = f"{phase1.get('technical_object', '')} {phase1.get('core_function', '')} {system_context}"
+
+                # Get extracted terms
+                extracted_terms = list(term_importance.keys())[:15]  # Top 15 terms
+
+                # Query graph
+                graph_results = self.knowledge_graph.find_initial_classes(
+                    patent_text=patent_text_for_search,
+                    extracted_terms=extracted_terms,
+                    top_k=10,
+                )
+
+                graph_classes = [cls for cls, score in graph_results if score > 0.3]
+                logger.info(
+                    "Phase 2a: Graph suggested classes: %s (scores: %s)",
+                    graph_classes,
+                    {cls: round(score, 3) for cls, score in graph_results[:5]},
+                )
+            except Exception as e:
+                logger.warning("Phase 2a graph query failed: %s", e)
+
+        # ─────────────────────────────
+        # PHASE 2b: Combine LLM + Graph suggestions
+        # ─────────────────────────────
+        # Merge LLM hypotheses with graph suggestions
+        combined_classes = list(
+            dict.fromkeys(cpc_classes + graph_classes)
+        )  # Preserve order, remove duplicates
+        if not combined_classes and cpc_classes:
+            combined_classes = cpc_classes
+
+        logger.info("Phase 2: Combined classes (LLM + Graph): %s", combined_classes)
+
+        # ─────────────────────────────
+        # PHASE 2c: XML expansion + improved scoring
+        # ─────────────────────────────
         candidates = []
+        score_margin = 0.0
+        confidence_level = "medium"
+
         try:
             all_subgroups = self.xml_parser.expand_classes(
-                cpc_classes, include_non_allocatable=False
+                combined_classes, include_non_allocatable=False
             )
             logger.info("Phase 2: Found %d total subgroups", len(all_subgroups))
 
             if all_subgroups:
-                # Use full_context for richer matching (includes parent titles)
                 title_count = len(all_subgroups)
-
-                # Build document frequencies from full context
                 doc_freq = Counter()
                 all_tokens = []
 
@@ -512,112 +301,120 @@ class CPCClassifier:
                     context = sg.get("full_context", title).lower()
                     context_tokens = all_tokens[idx]
                     score = 0.0
+                    matching_terms = 0
 
-                    # ── NEGATIVE SIGNAL PENALTY ──
-                    # Check if this code matches any negative signal
-                    negative_match = False
+                    # Negative signal penalty (soft, using confidence)
+                    negative_signals = phase1.get("negative_signals", [])
+                    negative_domains = phase1.get("negative_domains", [])
                     for neg in negative_signals:
-                        if neg in context or neg in title:
-                            score -= 5.0  # Strong penalty
-                            negative_match = True
-                            logger.debug(
-                                "Negative signal '%s' matched for %s", neg, symbol
-                            )
+                        if isinstance(neg, dict):
+                            term = neg.get("term", "").lower()
+                            conf = neg.get("confidence", 0.5)
+                        else:
+                            term = str(neg).lower()
+                            conf = 0.5
+                        if term in context or term in title:
+                            score -= 5.0 * conf
 
-                    for neg_domain in negative_domains:
-                        if neg_domain in context or neg_domain in title:
-                            score -= 3.0  # Medium penalty
-                            negative_match = True
+                    for neg in negative_domains:
+                        if isinstance(neg, dict):
+                            domain = neg.get("domain", "").lower()
+                            conf = neg.get("confidence", 0.5)
+                        else:
+                            domain = str(neg).lower()
+                            conf = 0.5
+                        if domain in context or domain in title:
+                            score -= 3.0 * conf
 
-                    # ── DOMAIN-SPECIFIC FILTERING ──
-                    # B60L: only keep if patent is actually about electrical/vehicle systems
-                    if symbol.startswith("B60L"):
-                        # Check if patent is about electrical/vehicle systems
-                        is_electrical_patent = any(
-                            w in system_context or w in core_function
-                            for w in [
-                                "electrical",
-                                "electric",
-                                "battery",
-                                "vehicle",
-                                "automotive",
-                                "powertrain",
-                                "ev ",
-                                "charging",
-                            ]
-                        )
-                        if not is_electrical_patent:
-                            continue  # Skip all B60L for non-electrical patents
+                    # Build multi-word phrases from terms for better semantic matching
+                    term_phrases = []
+                    for term in term_importance.keys():
+                        words = term.split()
+                        if len(words) >= 2:
+                            # Add bigrams and trigrams
+                            for i in range(len(words) - 1):
+                                term_phrases.append(" ".join(words[i : i + 2]))
+                            for i in range(len(words) - 2):
+                                term_phrases.append(" ".join(words[i : i + 3]))
 
-                        # For electrical patents, only keep cooling/thermal/battery codes
-                        cooling_related = any(
-                            w in context
-                            for w in [
-                                "cool",
-                                "heat",
-                                "thermal",
-                                "temperature",
-                                "battery",
-                                "propulsion",
-                            ]
-                        )
-                        if not cooling_related:
-                            continue
-
-                    # F16J in wellhead context: only keep if actually relevant
-                    if (
-                        symbol.startswith("F16J")
-                        and is_system_first
-                        and "E21B" in cpc_classes
-                    ):
-                        # Only keep F16J codes that mention specific seal types relevant to wellheads
-                        wellhead_seal_related = any(
-                            w in context
-                            for w in [
-                                "metal",
-                                "dynamic",
-                                "packing",
-                                "gasket",
-                                "seal ring",
-                                "casing",
-                                "tubing",
-                                "wellhead",
-                                "annulus",
-                            ]
-                        )
-                        if not wellhead_seal_related:
-                            # Don't skip entirely, just don't boost
-                            pass
-
-                    # ── TERM MATCHING ──
+                    # Term matching with importance weighting
                     for term, importance in term_importance.items():
                         term_score = 0.0
                         term_tokens = _tokenize(term)
-
                         if not term_tokens:
                             continue
 
-                        # 1. Word overlap scoring (Jaccard-like)
+                        # Multi-word phrase matching (strong signal)
+                        if len(term.split()) >= 2 and term in context:
+                            avg_df = sum(doc_freq.get(t, 1) for t in term_tokens) / len(
+                                term_tokens
+                            )
+                            idf = math.log(title_count / max(avg_df, 1))
+                            importance_weight = importance / 5.0
+                            term_score += (
+                                idf * importance_weight * 8
+                            )  # Higher weight for phrase matches
+                            matching_terms += 1
+
+                        # Word overlap
                         overlap = term_tokens & context_tokens
                         if overlap:
-                            # IDF-weighted overlap
                             overlap_idf = sum(
                                 math.log(title_count / max(doc_freq.get(t, 1), 1))
                                 for t in overlap
                             )
                             term_score += overlap_idf * (importance / 5.0) * 3
 
-                        # 2. Substring matching for multi-word terms
-                        if term in context:
-                            # Calculate IDF for the term based on constituent words
+                        # Single-word substring match (penalize if ambiguous)
+                        if len(term.split()) == 1 and term in context:
+                            # Check if the single word appears in a relevant context
+                            # by looking at surrounding words in the CPC context
                             avg_df = sum(doc_freq.get(t, 1) for t in term_tokens) / len(
                                 term_tokens
                             )
                             idf = math.log(title_count / max(avg_df, 1))
                             importance_weight = importance / 5.0
-                            term_score += idf * importance_weight * 5
+                            base_score = idf * importance_weight * 5
 
-                        # 3. Synonym matching
+                            # Penalize if the single word is a false friend
+                            # (e.g., "exchange" in dialog context vs "data exchange")
+                            false_friend_penalty = 0.0
+                            if term in [
+                                "exchange",
+                                "response",
+                                "system",
+                                "user",
+                                "transfer",
+                            ]:
+                                # Check if the CPC context suggests a different meaning
+                                if any(
+                                    marker in context
+                                    for marker in [
+                                        "data exchange",
+                                        "clipboard",
+                                        "dde",
+                                        "ole",
+                                        "fault response",
+                                        "error response",
+                                        "redundant",
+                                        "fault tolerance",
+                                        "backup",
+                                        "input device",
+                                        "brain wave",
+                                        "eeg",
+                                        "emg",
+                                        "printer",
+                                        "peripheral",
+                                    ]
+                                ):
+                                    false_friend_penalty = (
+                                        base_score * 0.7
+                                    )  # Reduce by 70%
+
+                            term_score += base_score - false_friend_penalty
+                            matching_terms += 1
+
+                        # Synonym match
                         synonyms = _get_expanded_terms(term)
                         for syn in synonyms:
                             if syn != term and syn in context:
@@ -626,217 +423,50 @@ class CPCClassifier:
                                     doc_freq.get(t, 1) for t in syn_tokens
                                 ) / max(len(syn_tokens), 1)
                                 idf = math.log(title_count / max(avg_df, 1))
-                                importance_weight = importance / 5.0
-                                term_score += idf * importance_weight * 4
+                                term_score += idf * (importance / 5.0) * 4
 
                         score += term_score
 
-                    # ── SYSTEM CONTEXT BOOST ──
+                    # Context boosts
                     sys_tokens = _tokenize(system_context)
                     sys_overlap = sys_tokens & context_tokens
                     for token in sys_overlap:
                         idf = math.log(title_count / max(doc_freq.get(token, 1), 1))
                         score += idf * 2
 
-                    # ── CORE FUNCTION BOOST ──
                     func_tokens = _tokenize(core_function)
                     func_overlap = func_tokens & context_tokens
                     for token in func_overlap:
                         idf = math.log(title_count / max(doc_freq.get(token, 1), 1))
                         score += idf * 4
 
-                    # ── CLASS-SPECIFIC BOOSTS ──
-                    # E21B: Boost wellhead/drilling codes strongly
-                    if symbol.startswith("E21B"):
-                        if any(
-                            w in context
-                            for w in [
-                                "wellhead",
-                                "tubing hanger",
-                                "casing",
-                                "annulus",
-                                "blowout",
-                                "christmas tree",
-                                "drilling",
-                            ]
-                        ):
-                            score *= 2.0
-                        elif any(
-                            w in context for w in ["well", "borehole", "downhole"]
-                        ):
-                            score *= 1.5
-                        elif any(w in context for w in ["valve", "seal", "packing"]):
-                            # Secondary boost for function-related E21B codes
-                            score *= 1.3
+                    # Domain-specific boost (calibrated, default 1.2 for unknown)
+                    base_multiplier = 1.2  # W2: Default for unknown domains
+                    class_prefix = symbol[:4] if len(symbol) >= 4 else symbol
+                    if class_prefix in domain_probs:
+                        # Scale multiplier by domain probability
+                        base_multiplier = 1.0 + (domain_probs[class_prefix] * 1.0)
+                    score *= base_multiplier
 
-                    # E21B29: Boost explosive cutting/cutter codes strongly
-                    if symbol.startswith("E21B29"):
-                        # Check for explosive-related terms (including plural forms)
-                        has_explosive = any(
-                            w in context
-                            for w in [
-                                "explosive",
-                                "explosives",
-                                "charge",
-                                "detonat",
-                                "blast",
-                                "shaped",
-                            ]
-                        )
-                        has_cutter = any(
-                            w in context
-                            for w in [
-                                "cutter",
-                                "cutting",
-                                "sever",
-                                "destroy",
-                            ]
-                        )
-                        has_perforat = "perforat" in context
-
-                        if has_explosive and has_cutter:
-                            score *= 3.0  # Strongest boost for explosive cutters
-                        elif has_explosive:
-                            score *= 2.5
-                        elif has_cutter:
-                            score *= 2.0
-                        elif has_perforat:
-                            score *= 1.8
-                        elif any(
-                            w in context for w in ["pipe", "tubing", "casing", "cable"]
-                        ):
-                            score *= 1.5
-
-                        # Extra boost for specific subgroups
-                        if "/02" in symbol and has_explosive:
-                            score *= 1.3  # Extra boost for E21B29/02 (by explosives)
-
-                    # E21B43: Boost completion/workover codes
-                    if symbol.startswith("E21B43"):
-                        if any(
-                            w in context
-                            for w in [
-                                "completion",
-                                "workover",
-                                "abandon",
-                                "idle",
-                                "plug",
-                                "accessory",
-                                "conduit",
-                            ]
-                        ):
-                            score *= 2.0
-                        elif any(
-                            w in context
-                            for w in ["well", "borehole", "downhole", "tubing"]
-                        ):
-                            score *= 1.3
-
-                    # E21B filtering: Skip irrelevant E21B codes
-                    if symbol.startswith("E21B") and not any(
-                        symbol.startswith(prefix)
-                        for prefix in ["E21B29", "E21B33", "E21B34", "E21B43"]
-                    ):
-                        # If core function is explosive cutting, skip unrelated E21B codes
-                        if any(
-                            w in core_function
-                            for w in ["explosive", "charge", "cut", "cutter"]
-                        ):
-                            if not any(
-                                w in context
-                                for w in [
-                                    "explosive",
-                                    "charge",
-                                    "cut",
-                                    "cutter",
-                                    "perforat",
-                                ]
-                            ):
-                                continue  # Skip unrelated E21B codes
-                        # If context mentions completion/idling, skip multilateral codes
-                        if any(
-                            w in system_context
-                            for w in ["completion", "idling", "abandon", "plug"]
-                        ):
-                            if "multilateral" in context or "lateral" in context:
-                                continue  # Skip multilateral codes
-
-                    # F01P: Boost cooling-related codes
-                    if symbol.startswith("F01P"):
-                        if any(
-                            w in context
-                            for w in [
-                                "vent",
-                                "deaerat",
-                                "degas",
-                                "air",
-                                "filling",
-                                "overflow",
-                            ]
-                        ):
-                            score *= 1.6
-                        elif any(
-                            w in context
-                            for w in ["cool", "heat", "thermal", "coolant", "radiator"]
-                        ):
-                            score *= 1.3
-
-                    # F16K: Boost valve-related codes
-                    if symbol.startswith("F16K"):
-                        if any(
-                            w in context
-                            for w in ["vent", "air", "bleed", "deaerat", "degas"]
-                        ):
-                            score *= 1.6
-                        elif any(w in context for w in ["valve", "tap", "cock"]):
-                            score *= 1.2
-
-                    # B60L: Boost battery/thermal codes
-                    if symbol.startswith("B60L"):
-                        if any(
-                            w in context
-                            for w in [
-                                "battery",
-                                "thermal",
-                                "cool",
-                                "heat",
-                                "temperature",
-                            ]
-                        ):
-                            score *= 1.4
-
-                    # F16J: Boost for metal/dynamic seals
-                    if symbol.startswith("F16J"):
-                        if any(
-                            w in context
-                            for w in ["metal", "dynamic", "mtm", "metal-to-metal"]
-                        ):
-                            score *= 1.5
-                        elif any(w in context for w in ["seal", "packing", "gasket"]):
-                            score *= 1.2
-
-                    # ── SPECIFICITY BONUS ──
-                    # Prefer more specific (longer/deeper) codes
+                    # Specificity bonus with term-density guard (W4)
                     symbol_depth = symbol.count("/") + sum(
                         symbol.count(d) for d in "0123456789"
                     )
-                    # Deeper symbols (more digits) are more specific
-                    depth_bonus = min(symbol_depth * 0.5, 3.0)
-                    score += depth_bonus
+                    if (
+                        matching_terms >= 2
+                    ):  # Only apply if at least 2 terms match at this depth
+                        depth_bonus = min(symbol_depth * 0.5, 3.0)
+                        score += depth_bonus
 
-                    if score > 0 and not negative_match:
-                        scored.append((score, sg))
-                    elif score > 0 and negative_match:
-                        # Still include but with penalty applied
-                        scored.append((score, sg))
+                    if score > 0:
+                        scored.append((score, sg, matching_terms))
 
                 scored.sort(key=lambda x: -x[0])
 
-                # Use softmax-like normalization for stability
+                # Normalization
                 if scored:
                     scores = [s[0] for s in scored]
                     max_score = max(scores)
-                    # Normalize: score / (max_score + median_score) for stability
                     median_score = (
                         sorted(scores)[len(scores) // 2]
                         if len(scores) > 1
@@ -844,18 +474,34 @@ class CPCClassifier:
                     )
                     denom = max_score + median_score * 0.5
 
-                    for score, sg in scored[:7]:
+                    # Calculate margin (W6)
+                    if len(scores) >= 2:
+                        score_margin = (scores[0] - scores[1]) / denom
+                        if score_margin > 0.3:
+                            confidence_level = "high"
+                        elif score_margin < 0.1:
+                            confidence_level = "low"
+                        else:
+                            confidence_level = "medium"
+
+                    for score, sg, _ in scored[:7]:
                         normalized_score = min(score / denom, 1.0)
                         candidates.append(
                             {
                                 "symbol": sg["symbol"],
                                 "title": sg["title"],
-                                "level": sg["level"],
+                                "level": sg.get("level", 0),
                                 "score": round(normalized_score, 4),
+                                "full_context": sg.get("full_context", sg["title"]),
                             }
                         )
 
-                logger.info("Phase 2: Selected %d matching candidates", len(candidates))
+                logger.info(
+                    "Phase 2: Selected %d candidates, margin=%.4f, confidence=%s",
+                    len(candidates),
+                    score_margin,
+                    confidence_level,
+                )
         except Exception as e:
             logger.error("Phase 2 expansion failed: %s", e)
 
@@ -865,37 +511,199 @@ class CPCClassifier:
         ranked = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:7]
 
         # ─────────────────────────────
-        # PHASE 4: Post-Ranking LLM Re-ranking
+        # PHASE 5: Multi-pass validation (W5)
         # ─────────────────────────────
+        validated_candidates = []
+        filtered_out = []
         best_code = None
-        re_ranked = []
+
         try:
             if ranked:
-                rerank_prompt_text = rerank_prompt(phase1, ranked)
-                rerank_response = self.llm.chat(
-                    system_prompt="You are a patent examiner with deep expertise in CPC classification.",
-                    user_message=rerank_prompt_text,
+                for candidate in ranked:
+                    val_prompt = validation_prompt_single(
+                        phase1, candidate, score_margin, confidence_level
+                    )
+                    val_response = self.llm.chat(
+                        system_prompt="You are a senior patent examiner validating a single CPC candidate.",
+                        user_message=val_prompt,
+                        temperature=0.1,
+                        max_tokens=2000,
+                    )
+                    val_data = _parse_llm_json(val_response)
+
+                    validation_result = {
+                        "symbol": candidate["symbol"],
+                        "title": candidate["title"],
+                        "validation": val_data.get("decision", "PASS"),
+                        "confidence": val_data.get("confidence", "medium"),
+                        "function_aligned": val_data.get("scores", {}).get(
+                            "function_alignment", 0
+                        )
+                        >= 0.6,
+                        "context_aligned": val_data.get("scores", {}).get(
+                            "context_alignment", 0
+                        )
+                        >= 0.5,
+                        "visual_bias": val_data.get("scores", {}).get(
+                            "visual_bias", False
+                        ),
+                        "justification": val_data.get("reasoning", ""),
+                        "rejection_reason": val_data.get("rejection_reason", ""),
+                    }
+
+                    if val_data.get("decision", "PASS").upper() == "PASS":
+                        validated_candidates.append(validation_result)
+                    else:
+                        filtered_out.append(validation_result)
+
+                # Select best code from validated candidates
+                if validated_candidates:
+                    # Pick the one with highest confidence
+                    high_conf = [
+                        v for v in validated_candidates if v.get("confidence") == "high"
+                    ]
+                    if high_conf:
+                        best = high_conf[0]
+                    else:
+                        best = validated_candidates[0]
+                    best_code = {
+                        "symbol": best["symbol"],
+                        "title": best["title"],
+                        "confidence": best["confidence"],
+                        "reasoning": best["justification"],
+                    }
+
+                # If all failed, fallback
+                if not validated_candidates and ranked:
+                    logger.warning(
+                        "Phase 5: All candidates failed validation. Using fallback."
+                    )
+                    fallback = ranked[0]
+                    validated_candidates.append(
+                        {
+                            "symbol": fallback["symbol"],
+                            "title": fallback["title"],
+                            "validation": "PASS",
+                            "confidence": "low",
+                            "function_aligned": False,
+                            "context_aligned": False,
+                            "visual_bias": True,
+                            "justification": "Fallback - all candidates failed validation",
+                            "rejection_reason": "",
+                        }
+                    )
+                    best_code = {
+                        "symbol": fallback["symbol"],
+                        "title": fallback["title"],
+                        "confidence": "low",
+                        "reasoning": "Fallback selection - manual review recommended.",
+                    }
+
+                logger.info(
+                    "Phase 5: %d passed, %d filtered. Best: %s",
+                    len(validated_candidates),
+                    len(filtered_out),
+                    best_code.get("symbol", "N/A") if best_code else "N/A",
+                )
+        except Exception as e:
+            logger.warning("Phase 5 validation failed: %s", e)
+            validated_candidates = [
+                {
+                    "symbol": node["symbol"],
+                    "title": node["title"],
+                    "validation": "PASS",
+                    "confidence": "medium",
+                    "justification": "Validation skipped due to error",
+                }
+                for node in ranked
+            ]
+            if ranked:
+                best_code = {
+                    "symbol": ranked[0]["symbol"],
+                    "title": ranked[0]["title"],
+                    "confidence": "medium",
+                    "reasoning": "Validation skipped due to error",
+                }
+
+        # ─────────────────────────────
+        # PHASE 6: Per-claim reconciliation (W7)
+        # ─────────────────────────────
+        reconciled_claims = []
+        try:
+            per_claim = phase1.get("claim_classifications", [])
+            if per_claim and (validated_candidates or filtered_out):
+                recon_prompt = reconciliation_prompt(
+                    validated_candidates, filtered_out, per_claim
+                )
+                recon_response = self.llm.chat(
+                    system_prompt="You are reconciling claim-level CPC classifications.",
+                    user_message=recon_prompt,
                     temperature=0.1,
                     max_tokens=2000,
                 )
-                rerank_data = _parse_llm_json(rerank_response)
-                re_ranked = rerank_data.get("re_ranked", [])
-                best_code = rerank_data.get("best_code", {})
-                logger.info("Phase 4: Best code: %s", best_code.get("symbol", "N/A"))
+                recon_data = _parse_llm_json(recon_response)
+                reconciled_claims = recon_data.get("reconciled_claims", [])
+                logger.info("Phase 6: Reconciled %d claims", len(reconciled_claims))
         except Exception as e:
-            logger.warning("Phase 4 re-ranking failed: %s", e)
+            logger.warning("Phase 6 reconciliation failed: %s", e)
 
+        # ─────────────────────────────
+        # PHASE 7: Final consistency check
+        # ─────────────────────────────
+        consistency_result = {}
+        try:
+            if validated_candidates:
+                # Build selected codes list for consistency check
+                selected = [
+                    {"symbol": v["symbol"], "title": v["title"]}
+                    for v in validated_candidates[:3]
+                ]
+                consist_prompt = consistency_check_prompt(phase1, selected)
+                consist_response = self.llm.chat(
+                    system_prompt="You are performing a final coherence check on CPC classifications.",
+                    user_message=consist_prompt,
+                    temperature=0.1,
+                    max_tokens=1500,
+                )
+                consist_data = _parse_llm_json(consist_response)
+                consistency_result = {
+                    "coherent": consist_data.get("coherent", True),
+                    "issues": consist_data.get("issues", []),
+                    "recommended_primary": consist_data.get("recommended_primary", ""),
+                    "recommended_secondary": consist_data.get(
+                        "recommended_secondary", []
+                    ),
+                    "reasoning": consist_data.get("reasoning", ""),
+                }
+                logger.info(
+                    "Phase 7: Consistency check: coherent=%s",
+                    consistency_result.get("coherent", True),
+                )
+        except Exception as e:
+            logger.warning("Phase 7 consistency check failed: %s", e)
+
+        # ─────────────────────────────
+        # Build final result
+        # ─────────────────────────────
+        cpc_source = validated_candidates if validated_candidates else ranked
         cpc = [
-            {"code": node["symbol"], "score": node.get("score", 0.0)} for node in ranked
+            {
+                "code": node.get("symbol", node["symbol"]),
+                "score": node.get("score", 0.0),
+            }
+            for node in cpc_source
         ]
 
         phase2 = {
             "codes": [node["symbol"] for node in ranked],
             "reasoning": (
-                "Ranked by improved TF-IDF scoring with word-level matching, parent context, "
-                "expanded synonyms, class-specific boosts, and negative signal penalties. "
-                "Claims terms weighted 2x. System-first strategy applied where appropriate."
+                "Ranked by improved TF-IDF scoring with section-aware term weighting, "
+                "word-level matching, parent context, expanded synonyms, and probabilistic "
+                "domain boosting. Score margin and confidence level calculated. "
+                "Claims terms weighted 2x."
             ),
+            "score_margin": round(score_margin, 4),
+            "confidence_level": confidence_level,
         }
 
         result = {
@@ -905,11 +713,37 @@ class CPCClassifier:
             "cpc": cpc,
         }
 
-        # Add Phase 4 results if available
-        if re_ranked:
-            result["phase4"] = {
-                "re_ranked": re_ranked,
+        if validated_candidates or filtered_out:
+            result["phase5"] = {
+                "validated_candidates": validated_candidates,
+                "filtered_out": filtered_out,
                 "best_code": best_code,
             }
+
+        if best_code and best_code.get("symbol"):
+            result["premier"] = {
+                "symbol": best_code.get("symbol"),
+                "title": best_code.get("title", ""),
+                "confidence": best_code.get("confidence", "medium"),
+                "reasoning": best_code.get("reasoning", ""),
+            }
+        elif ranked:
+            result["premier"] = {
+                "symbol": ranked[0]["symbol"],
+                "title": ranked[0]["title"],
+                "confidence": "medium",
+                "reasoning": "Top-scoring candidate from Phase 2/3 scoring",
+            }
+
+        if reconciled_claims:
+            result["per_claim"] = reconciled_claims
+        else:
+            # Fallback to original per-claim if reconciliation failed
+            claim_classifications = phase1.get("claim_classifications", [])
+            if claim_classifications:
+                result["per_claim"] = claim_classifications
+
+        if consistency_result:
+            result["phase7"] = consistency_result
 
         return result

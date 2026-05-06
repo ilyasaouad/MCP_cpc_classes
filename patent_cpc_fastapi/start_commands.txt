@@ -1,0 +1,14 @@
+MCP server: MCP_cpc_classes/MCP_patent_classification
+
+npm run dev
+
+FastAPI: MCP_cpc_classes/patent_cpc_fastapi
+source .venv/Script/activate
+
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000 
+
+
+Streamlit: MCP_cpc_classes/cpc_client
+source .venv/Script/activate
+
+streamlit run streamlit_app.py 

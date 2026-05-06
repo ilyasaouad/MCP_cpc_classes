@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+
+# CPC Knowledge Graph Cache (generated files)
+app/cpc_classification/resources/cpc_graph.pkl
+app/cpc_classification/resources/cpc_embeddings.npz
+app/cpc_classification/resources/cpc_graph_meta.json
+
+# Chroma DB (if used)
+chroma_db/
+
+# Logs
+*.log

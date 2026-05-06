@@ -4,3 +4,7 @@ ollama
 python-dotenv
 pydantic
 requests
+networkx>=3.0
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
