@@ -116,23 +116,22 @@ Importance score calibration (use this scale strictly, adjusted by section weigh
 """
 
 
-def phase1_prompt(cpc_hints: str, labeled_claims: str, description: str) -> str:
+def phase1_prompt(labeled_claims: str, description: str) -> str:
     """
-    Phase 1 prompt: Examiner-grade CPC classification with section-aware extraction.
+    Phase 1 prompt: Semantic extraction only - NO CPC class assignment.
+
+    Responsibility: Understand the invention technically.
+    Do NOT predict CPC classes - that is Phase 2's job via Knowledge Graph.
     """
 
-    return f"""You are a patent classification expert trained in CPC (Cooperative Patent Classification).
+    return f"""You are a patent technical analysis expert.
 
 Your task is to analyze the patent description and claims and produce a structured JSON output
-for CPC classification. Follow each step strictly and in order.
+that captures the invention's technical essence. 
 
-=== CPC REFERENCE (AUTHORITATIVE) ===
-The following CPC hierarchy was retrieved from the EPO Linked Open Data API.
-You MUST use it to verify every class you select. Only output classes that appear
-in this reference. If your reasoning leads to a class not present here, revise your
-choice to the closest ancestor that IS present.
-
-{cpc_hints}
+IMPORTANT: Do NOT assign CPC classes or predict patent classifications. 
+Your job is semantic extraction only - understanding what the invention is and does.
+CPC classification will be performed separately by a knowledge graph system.
 
 === CLAIMS (PRE-LABELED) ===
 The claims below have been pre-processed. Each claim is prefixed with either
@@ -174,16 +173,23 @@ Rules:
 
 ---
 
-STEP 2 — SYSTEM CONTEXT
+STEP 2 — SYSTEM CONTEXT & INDUSTRY
 
-Identify the broader technical system or industry in which the invention operates.
+Identify:
+1. The broader technical system or industry in which the invention operates
+2. What professionals or industries will USE this invention
 
 Rules:
 - Must describe an industry/application domain, NOT a component
 - Ask: "What industry would buy/use this invention?"
+- Ask: "What professionals (engineers, doctors, farmers, etc.) would use this?"
 - Must be a system or application (e.g., "database search engines"), not a part
+- Consider: healthcare, agriculture, manufacturing, telecommunications, finance, automotive, etc.
 
-Output: system_context
+Output format:
+- system_context: The technical system (e.g., "natural language processing systems")
+- target_industry: The primary industry (e.g., "customer service automation", "medical diagnostics")
+- target_professionals: Who uses it (e.g., "software developers", "physicians", "farm equipment operators")
 
 ---
 
@@ -204,7 +210,7 @@ Output: core_function
 
 ---
 
-STEP 4 — CLAIM TYPE ANALYSIS (NEW)
+STEP 4 — CLAIM TYPE ANALYSIS
 
 For EACH independent claim, classify its type:
 
@@ -225,7 +231,13 @@ STEP 5 — ESSENTIAL TECHNICAL TERMS (SECTION-AWARE)
 
 Extract terms with importance (1-10), recording the source section.
 
-Extraction rules:
+CRITICAL: Extract COMPOUND terms that include the technical object, not isolated verbs:
+- GOOD: "weight clipping" (clipping OF weights in neural networks)
+- GOOD: "model quantization" (quantization OF models)
+- BAD: "clipping" (ambiguous - could be image clipping)
+- BAD: "quantization" (too generic without object)
+
+Rules:
 - From claims (INDEPENDENT only) → base importance 9-10
 - From summary of invention → base importance 7-9
 - From detailed description → base importance 5-8
@@ -263,86 +275,141 @@ Output:
 
 ---
 
-STEP 7 — CLASSIFICATION STRATEGY
+STEP 7 — INVENTION CHARACTERIZATION STRATEGY
 
-Choose ONE of three strategies:
+Characterize the invention's nature to guide downstream classification:
 
   "system-first"   - The invention is a complete apparatus/machine for a SPECIFIC industry.
                      No other industry would use this exact invention.
-                     PRIMARY class = application domain (E21B, B60L, A61B ...)
+                     Example domains: oil drilling, automotive braking, medical surgery
 
   "function-first" - The invention is a generic component usable across MULTIPLE industries.
-                     PRIMARY class = core function (F16J, F16K, F04, G06N ...)
+                     Example functions: neural networks, sealing, valves, cooling
 
   "hybrid"         - The invention has a novel functional mechanism AND is tied to a specific
-                     application. Both domain AND function classes are co-primary.
-                     List them in order of specificity.
+                     application.
 
 Decision rule:
-  Ask: "Could this exact invention be deployed in two or more unrelated industries without
-  modification?" If NO -> system-first. If YES -> function-first. If the functional
-  innovation is as significant as the application specificity -> hybrid.
+  1. Consider target_industry from Step 2: Is the invention tied to ONE specific industry?
+     - If YES (e.g., oil drilling, medical surgery, automotive braking) -> system-first
+     - If NO (could be used in many industries) -> function-first
+  2. Consider target_professionals: Are the users specialists in one field?
+     - Surgeons, miners, farmers -> system-first likely
+     - Software engineers, data scientists -> function-first likely
+  3. Ask: "Could this exact invention be deployed in two or more unrelated industries without
+     modification?" If NO -> system-first. If YES -> function-first.
+  4. If the functional innovation is as significant as the application specificity -> hybrid.
 
 Self-consistency check (mandatory before proceeding):
   Re-read your technical_object from Step 1.
-  Confirm that your chosen strategy is consistent with that description.
+  Confirm that your chosen strategy is consistent with that description AND target_industry.
   If there is tension, revise system_context or core_function before continuing.
 
 Output:
 - classification_strategy: "system-first" | "function-first" | "hybrid"
-- strategy_reasoning: explanation referencing technical_object, system_context, core_function
+- strategy_reasoning: explanation referencing technical_object, system_context, core_function, target_industry
 - consistency_check: "consistent" | "revised - [what was revised and why]"
 
 ---
 
-STEP 7b — DOMAIN GUIDANCE FOR COMPUTING AND SOFTWARE PATENTS (CRITICAL)
+STEP 7b — PRIMARY TECHNICAL DOMAIN DETECTION (CRITICAL)
 
-If the invention involves ANY of the following, use these CPC mappings:
+Analyze the invention and determine the PRIMARY technical domain based on:
+1. Technical object (what is being improved?)
+2. System context (where is it used?)
+3. Core function (what does it do?)
 
-SOFTWARE / COMPUTING DOMAINS:
-- LLM, chatbot, natural language processing, dialog system, conversational AI
-  → PRIMARY: G06F16 (information retrieval), G06F17 (digital computing)
-  → SECONDARY: G06N3 (neural networks), G06F40 (natural language processing)
-  → AVOID: G06F11 (fault tolerance), G06F3 (input devices), G06F9 (data transfer)
+Select ONE primary domain from this list. Be decisive - do NOT hedge:
 
-- Query-response system, search engine, information retrieval
-  → G06F16 (information retrieval, database structures)
-  → G06F16/30 (digital computing for information retrieval)
-  → G06F16/3329 (query formulation with natural language)
-  → G06F16/90332 (natural language interfaces)
+- AI / Machine Learning / Neural Networks → G06N
+- General Computing / Data Processing / Software → G06F
+- Image / Video / Graphics Processing → G06T
+- Computer Vision / Pattern Recognition → G06V
+- Speech / Audio / Acoustic Processing → G10L
+- Telecommunications / Networking → H04L
+- Wireless Communication → H04W
+- Semiconductors / Integrated Circuits → H01L
+- Medical Technology / Diagnostics → A61B
+- Pharmaceutical / Biotech → A61K
+- Mechanical Engineering / Structures → F16
+- Engines / Turbines / Pumps → F01-F04
+- Control Systems / Automation → G05B
+- Measurement / Sensors / Testing → G01
+- Data Storage / Memory → G11
+- Vehicles / Transport / Automotive → B60
+- Chemistry / Materials / Chemical Processes → C01-C12
+- Manufacturing / Machining → B23
+- Oil / Gas / Mining / Drilling → E21
 
-- API, client-server communication, network messaging
-  → H04L29/06 (communication control), H04L67/02 (web-based client-server)
-  → NOT G06F9/543 (clipboard/data exchange - that's for local OS-level transfer)
+RULE: Domain must reflect the INDUSTRY / SYSTEM / SUBJECT MATTER, not just the algorithm or generic computation.
 
-- Voice/speech processing in dialog systems
-  → G10L15/22 (speech recognition), G10L15/24 (dialog systems)
-  → PLUS G06F16 or G06F17 for the dialog management aspect
-
-ANTI-PATTERNS — Do NOT map these words literally:
-- "exchange" in dialog context (role exchange) → NOT G06F9/543 (data exchange)
-- "response" in chat context → NOT G06F11/277 (fault response)
-- "system" in software context → NOT G06F11/182 (redundant systems)
-- "user" in chatbot context → NOT G06F3/015 (user input devices)
-- "transfer" of messages → NOT G06F9/543 unless it's OS-level clipboard/DDE
-
----
-
-STEP 8 — INITIAL CPC CLASS HYPOTHESES (SOFT)
-
-Suggest 3-5 CPC classes (4-character codes like F01P, F16K, B60L, E21B).
-
-IMPORTANT:
-- These are hypotheses, NOT enforced
-- Assign confidence (0.0-1.0) per class
-- The LLM can override these later if evidence is strong
+Examples:
+- "Neural network weight quantization" → AI/ML (G06N) — the NN is the SUBJECT
+- "Image clipping for graphics" → Image Processing (G06T) — the image is the SUBJECT
+- "Speech recognition system" → Audio Processing (G10L) — speech is the SUBJECT
+- "Sealing mechanism for engines" → Mechanical (F16) — the seal is the SUBJECT
+- "Data transmission protocol" → Telecom (H04L) — communication is the SUBJECT
 
 Output:
-- class_hypotheses: [ {{ "class": "G06F", "confidence": 0.7, "reasoning": "..." }} ]
+- primary_domain: {{ "name": "AI / Machine Learning", "cpc_class": "G06N", "confidence": 0.9 }}
+- domain_reasoning: "The invention improves neural network models through weight manipulation."
 
 ---
 
-STEP 9 — NEGATIVE SIGNALS (SOFT)
+STEP 7c — CONTEXTUAL TERM DISAMBIGUATION (CRITICAL)
+
+For each extracted term, determine its meaning using OBJECT + DOMAIN + CONTEXT.
+
+Many technical terms are ambiguous without context:
+- "clipping": weight clipping (G06N) vs image clipping (G06T) vs audio clipping (G10L)
+- "filtering": signal filtering (H04L) vs image filtering (G06T) vs data filtering (G06F)
+- "encoding": video encoding (G06T) vs text encoding (G06F) vs channel encoding (H04L)
+- "compression": model compression (G06N) vs image compression (G06T) vs data compression (G06F)
+- "mapping": memory mapping (G06F) vs image mapping (G06T) vs neural mapping (G06N)
+
+RULE: TERM meaning = f(object, system_context, domain)
+
+For each ambiguous term in your extraction, resolve:
+- term: "clipping"
+- disambiguated_meaning: "weight clipping in neural networks"
+- correct_domain: "G06N"
+- incorrect_domains: ["G06T", "G10L"]
+- justification: "The patent describes clipping neural network weights, not image regions"
+
+Output:
+- disambiguated_terms: [ {{ "term": "string", "meaning": "string", "domain": "G06N", "avoid": ["G06T"] }} ]
+
+---
+
+STEP 8 — DOMAIN SIGNALS (CRITICAL FOR DOWNSTREAM CLASSIFICATION)
+
+Identify specific technical domains and technologies present in the invention.
+This helps the downstream classification system map to the correct CPC families.
+
+For each domain signal:
+- name: The technology/domain name (e.g., "neural networks", "wireless communication")
+- confidence: How certain (0.0-1.0) that this domain is central to the invention
+- evidence: Which terms or claim elements support this
+- cpc_family: The 3-char CPC family this domain maps to (e.g., "G06N", "H04L")
+
+IMPORTANT:
+1. The PRIMARY domain from Step 7b MUST be listed first with highest confidence
+2. List ALL relevant domains, even if seemingly contradictory
+3. Be explicit about tool vs purpose: if AI is used for image processing, list BOTH but mark image as primary
+4. Include NEGATIVE mappings: domains that are NOT relevant but could be confused
+
+Example domain signals:
+- {{ "name": "neural network parameter optimization", "confidence": 0.95, "evidence": "weight clipping, quantization, model compression", "cpc_family": "G06N", "role": "primary" }}
+- {{ "name": "image processing", "confidence": 0.1, "evidence": "none - possible confusion from 'clipping'", "cpc_family": "G06T", "role": "negative" }}
+- {{ "name": "natural language processing", "confidence": 0.9, "evidence": "LLM, text generation", "cpc_family": "G06F", "role": "primary" }}
+- {{ "name": "embedded systems", "confidence": 0.8, "evidence": "vehicle onboard processor", "cpc_family": "G06F", "role": "secondary" }}
+
+Output:
+- domain_signals: [ {{ "name": "string", "confidence": 0.9, "evidence": "string", "cpc_family": "G06N", "role": "primary|secondary|negative" }} ]
+
+---
+
+STEP 9 — NEGATIVE SIGNALS
 
 Extract terms and domains that this patent is clearly NOT about.
 
@@ -351,33 +418,23 @@ Rules:
 - Focus on domains that could be confused with the correct classification
 - At least 5 negative signals, at least 2 negative domains
 - Assign confidence (0.0-1.0) per signal, NOT absolute exclusions
+- Map each negative domain to a CPC family to penalize
+
+CRITICAL for all patents:
+- If primary domain is G06N (AI): explicitly list "image processing" (G06T), "acoustics" (G10K) as negatives
+- If primary domain is G06T (image): explicitly list "neural networks" (G06N) unless AI is actually used
+- If primary domain is H04L (telecom): explicitly list "general computing" (G06F) unless relevant
+- If primary domain is F16 (mechanical): explicitly list "software" (G06F) unless relevant
+
+Examples:
+- Negative signal: "image processing" (confidence: 0.9) → penalize G06T
+- Negative signal: "computer graphics" (confidence: 0.8) → penalize G06T
+- Negative signal: "audio processing" (confidence: 0.7) → penalize G10L
 
 Output:
-- negative_signals: [ {{ "term": "image processing", "confidence": 0.8 }} ]
-- negative_domains: [ {{ "domain": "computer vision", "confidence": 0.9 }} ]
+- negative_signals: [ {{ "term": "image processing", "confidence": 0.8, "penalize_family": "G06T" }} ]
+- negative_domains: [ {{ "domain": "computer vision", "confidence": 0.9, "penalize_family": "G06V" }} ]
 - negative_reasoning: brief explanation
-
----
-
-STEP 10 — PER-CLAIM PRELIMINARY CPC
-
-For EACH claim (independent + significant dependents), assign 1-2 CPC subclasses.
-
-Rules:
-- Claim 1 (independent) maps to the PRIMARY/broadest classes for the overall invention
-- Dependent claims MAY map to the same classes OR additional classes if they add novel technical elements
-- Use specific 6-8 digit subclasses where possible (e.g., G06F16/00, not just G06F)
-- Focus on the NOVEL contribution of each claim
-- If a dependent claim does NOT add a new technical area, map it to the same classes as its parent claim
-- Mark all as "provisional": true (subject to Phase 5/6 validation)
-
-For each claim, output:
-- claim_number: integer
-- claim_type: "independent" or "dependent"
-- parent_claim: null for independent, or the claim number it depends on
-- cpc_classes: [1-2 specific CPC subclasses]
-- reasoning: Brief explanation
-- provisional: true
 
 ---
 
@@ -388,6 +445,8 @@ OUTPUT FORMAT (STRICT JSON - no markdown, no text outside the JSON object)
   "problem_solved": "string",
   "solution_summary": "string",
   "system_context": "string",
+  "target_industry": "string",
+  "target_professionals": "string",
   "core_function": "string",
   "claim_analysis": [
     {{
@@ -408,12 +467,36 @@ OUTPUT FORMAT (STRICT JSON - no markdown, no text outside the JSON object)
   "classification_strategy": "system-first",
   "strategy_reasoning": "string",
   "consistency_check": "consistent",
-  "class_hypotheses": [
-    {{"class": "G06F", "confidence": 0.7, "reasoning": "string"}}
+  "primary_domain": {{
+    "name": "AI / Machine Learning",
+    "cpc_class": "G06N",
+    "confidence": 0.95,
+    "reasoning": "The invention improves neural network models"
+  }},
+  "domain_signals": [
+    {{
+      "name": "neural network parameter optimization",
+      "confidence": 0.95,
+      "evidence": "weight clipping, quantization",
+      "cpc_family": "G06N",
+      "role": "primary"
+    }},
+    {{
+      "name": "image processing",
+      "confidence": 0.1,
+      "evidence": "none - confusion possible",
+      "cpc_family": "G06T",
+      "role": "negative"
+    }}
   ],
-  "cpc_classes": ["E21B", "F16J"],
-  "cpc_sections": ["E", "F"],
-  "cpc_reasoning": "string",
+  "disambiguated_terms": [
+    {{
+      "term": "clipping",
+      "meaning": "weight clipping in neural networks",
+      "domain": "G06N",
+      "avoid": ["G06T", "G10L"]
+    }}
+  ],
   "terms": [
     {{
       "term": "string",
@@ -423,22 +506,12 @@ OUTPUT FORMAT (STRICT JSON - no markdown, no text outside the JSON object)
     }}
   ],
   "negative_signals": [
-    {{"term": "string", "confidence": 0.6}}
+    {{"term": "image processing", "confidence": 0.8, "penalize_family": "G06T"}}
   ],
   "negative_domains": [
-    {{"domain": "string", "confidence": 0.6}}
+    {{"domain": "computer vision", "confidence": 0.9, "penalize_family": "G06V"}}
   ],
-  "negative_reasoning": "string",
-  "claim_classifications": [
-    {{
-      "claim_number": 1,
-      "claim_type": "independent",
-      "parent_claim": null,
-      "cpc_classes": ["G01N1/00", "B01D35/00"],
-      "reasoning": "string",
-      "provisional": true
-    }}
-  ]
+  "negative_reasoning": "string"
 }}
 """
 
@@ -610,22 +683,49 @@ Description: {candidate.get("full_context", candidate.get("title", ""))}
    - 0.5 = Related: class is in an adjacent domain
    - 0.0 = Wrong domain: class belongs to a completely different industry
 
-3. VISUAL BIAS CHECK
+3. CROSS-DOMAIN LEAKAGE CHECK (CRITICAL — GENERALIZED)
+   
+   === DOMAIN DOMINANCE RULE ===
+   The invention's PRIMARY DOMAIN (from Phase 1) is: {phase1_data.get("primary_domain", {}).get("name", "unknown")} ({phase1_data.get("primary_domain", {}).get("cpc_class", "unknown")})
+   
+   Check the candidate's CPC family against the primary domain:
+   - If candidate is in the SAME domain as primary → STRONG PASS signal
+   - If candidate is in a RELATED domain (supporting/aspect) → CONDITIONAL PASS
+   - If candidate is in an UNRELATED domain → STRONG FAIL signal
+   
+   === CROSS-DOMAIN LEAKAGE PREVENTION ===
+   Penalize these UNLESS explicitly supported by the invention:
+   - G06T (image) if invention is NOT about image/video/graphics
+   - G10L/K (audio/acoustics) if invention is NOT about sound/audio
+   - G06V (vision) if invention is NOT about computer vision
+   - G06N (AI) if invention is NOT about machine learning/neural networks
+   - H04L/W (telecom) if invention is NOT about communication
+   - F16 (mechanical) if invention is NOT about mechanical engineering
+   - A61 (medical) if invention is NOT about healthcare
+   
+   Rationale: Prevents keyword-based misclassification across domains.
+
+4. VISUAL/DOMAIN BIAS CHECK
    If the class mentions image, video, pixel, frame, camera, visual, picture, or photograph:
    - Does the invention ACTUALLY process images/video? (true/false)
-   - If false, this is a visual bias mismatch
+   - If false, this is a domain bias mismatch
+   
+   Similarly check for other domain-specific terms:
+   - Audio/speech terms → is invention about audio?
+   - Neural network terms → is invention about AI?
+   - Mechanical terms → is invention about mechanical systems?
 
-4. METHOD VS APPARATUS CHECK (CRITICAL)
+5. METHOD VS APPARATUS CHECK (CRITICAL)
    - If claim type is METHOD: Does this CPC subgroup primarily describe methods/processes?
    - If APPARATUS: Does it primarily describe systems/devices?
    - If BOTH: Does it cover both, or at least not exclude either?
 
-5. SPECIFICITY FIT
+6. SPECIFICITY FIT
    - too_broad: Class is too generic to capture the novel contribution
    - appropriate: Class specificity matches the invention's detail level
    - too_narrow: Class is more specific than the invention's scope
 
-6. DOMAIN APPROPRIATENESS CHECK (CRITICAL — DYNAMIC)
+7. DOMAIN APPROPRIATENESS CHECK (CRITICAL — DYNAMIC)
    Analyze the candidate's CPC domain against the invention's system context and core function.
    
    INSTRUCTION: Based ONLY on the System Context and Core Function provided above, determine:
@@ -644,13 +744,24 @@ Description: {candidate.get("full_context", candidate.get("title", ""))}
       - Invention is about text processing, but candidate is about image processing
       - Invention is about data retrieval, but candidate is about fault tolerance
       - Invention is about mechanical seals, but candidate is about neural networks
+      - Invention is about telecom protocols, but candidate is about medical imaging
    
    d) Rejection rule:
       - If the candidate is a CLEAR MISMATCH (completely wrong domain) → FAIL immediately
       - If the candidate is RELATED but not the primary focus → PASS with LOW confidence
       - If the candidate MATCHES the primary domain → PASS with confidence based on other checks
 
-7. CONTRADICTION CHECK
+8. INTRA-DOMAIN SPECIALIZATION CHECK
+   If the candidate is in the correct domain, check if the SUBGROUP matches the specific function:
+   
+   Examples:
+   - G06N (AI): parameter optimization → G06N 3/045; model compression → G06N 3/063
+   - G06T (image): filtering → G06T 5/00; rendering → G06T 15/00
+   - H04L (telecom): error correction → H04L 1/00; protocols → H04L 29/00
+   
+   Does the candidate's subgroup reflect the INVENTIVE CONTRIBUTION, not just the field?
+
+9. CONTRADICTION CHECK
    Does this class conflict with the core function or system context in any way?
 
 === DECISION RULES ===
@@ -658,6 +769,7 @@ Description: {candidate.get("full_context", candidate.get("title", ""))}
 PASS if:
 - function_alignment >= 0.6 AND
 - context_alignment >= 0.5 AND
+- cross_domain_leakage == false (not in unrelated domain) AND
 - visual_bias == false AND
 - method_apparatus_aligned == true AND
 - specificity_fit != "too_broad" AND
@@ -665,9 +777,15 @@ PASS if:
 
 FAIL if any critical check fails.
 
-If the candidate belongs to a COMPLETELY WRONG domain for this invention (e.g., chatbot patent classified in fault tolerance), set decision to FAIL regardless of other scores.
+If the candidate belongs to a COMPLETELY WRONG domain for this invention (e.g., chatbot patent classified in fault tolerance, or telecom patent in medical devices), set decision to FAIL regardless of other scores.
 
 If score_margin < 0.1, mark confidence as LOW regardless of other factors.
+
+=== MULTI-LABEL GUIDANCE ===
+If the invention has multiple distinct technical contributions:
+- PRIMARY CPC should cover the MAIN inventive concept
+- SECONDARY CPC (if any) should cover a SUPPORTING aspect
+- Do NOT assign multiple CPCs for the SAME concept
 
 === OUTPUT ===
 {{
@@ -765,6 +883,7 @@ Technical Object: {phase1_data.get("technical_object", "")}
 Core Function: {phase1_data.get("core_function", "")}
 System Context: {phase1_data.get("system_context", "")}
 Classification Strategy: {phase1_data.get("classification_strategy", "")}
+Primary Domain: {phase1_data.get("primary_domain", {}).get("name", "unknown")} ({phase1_data.get("primary_domain", {}).get("cpc_class", "unknown")})
 
 === SELECTED CPC CODES ===
 {codes_list}
@@ -775,6 +894,26 @@ Classification Strategy: {phase1_data.get("classification_strategy", "")}
 3. Is one code clearly dominant/primary?
 4. Do the codes cover both method and apparatus aspects if needed?
 5. Are any codes redundant or overlapping?
+6. DOMAIN DOMINANCE CHECK (CRITICAL):
+   - Does the PRIMARY selected code match the invention's primary domain?
+   - If the invention is about AI (G06N), is G06N the primary code?
+   - If the invention is about telecom (H04L), is H04L the primary code?
+   - If the invention is about mechanical (F16), is F16 the primary code?
+   - Cross-domain leakage: Is there a code from an UNRELATED domain? (e.g., G06T for non-image, G10L for non-audio)
+7. INTRA-DOMAIN SPECIALIZATION CHECK:
+   - Does the subgroup reflect the SPECIFIC function? (e.g., G06N 3/045 for parameter optimization, not just G06N 3/00)
+   - Is the code too broad or too narrow for the invention?
+8. MULTI-LABEL CHECK:
+   - If multiple codes: Do they represent DISTINCT contributions?
+   - PRIMARY: Main inventive concept
+   - SECONDARY: Supporting aspect (e.g., hardware acceleration for AI)
+   - Do NOT assign multiple codes for the SAME concept
+
+=== FINAL GUARD RULES ===
+- If primary_domain is G06N but selected primary is G06T → INCONSISTENT (cross-domain leakage)
+- If primary_domain is H04L but selected primary is G06F → INCONSISTENT (unless computing is the focus)
+- If primary_domain is F16 but selected primary is G06N → INCONSISTENT (unless AI is the focus)
+- If selected codes contain both G06T and G06N → check if invention is actually multi-domain (AI for image processing) or if it's leakage
 
 Output:
 {{
@@ -782,6 +921,10 @@ Output:
   "issues": ["string" or []],
   "recommended_primary": "G06F16/00",
   "recommended_secondary": ["G06N3/08"],
+  "domain_consistent": true or false,
+  "cross_domain_leakage": true or false,
+  "leakage_details": "Description of any cross-domain issues",
+  "specialization_fit": "appropriate" or "too_broad" or "too_narrow",
   "reasoning": "Explanation of coherence assessment"
 }}
 

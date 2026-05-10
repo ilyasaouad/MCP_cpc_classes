@@ -6,18 +6,6 @@ from search_core.ollama_client import OllamaClient
 from .prompts import phase1_prompt
 
 
-def load_cpc_hints(path: str = "resources/ipc_cpc_hints.txt") -> str:
-    # Resolve relative to this file so it works regardless of CWD
-    if not os.path.isabs(path):
-        here = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(here, path)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
-
-
 def _normalize_terms(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Normalize term extraction from both description_terms and claims_terms.
@@ -95,15 +83,34 @@ def _normalize_terms(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 class CPCExtractor:
     """
     Phase 1:
-    Extract CPC classes + technical terms from patent text.
+    Extract semantic understanding (terms, function, domains) from patent text.
+    NO CPC class prediction - that is Phase 2's responsibility.
     """
 
     def __init__(self, llm: OllamaClient):
         self.llm = llm
-        self.cpc_hints = load_cpc_hints()
 
     def extract(self, description: str, labeled_claims: str) -> Dict[str, Any]:
-        prompt = phase1_prompt(self.cpc_hints, labeled_claims, description)
+        # Truncate long texts to prevent LLM timeout
+        # Keep claims intact (most important), truncate description
+        MAX_DESC_CHARS = 3000  # ~750 tokens
+        MAX_CLAIMS_CHARS = 2000  # ~500 tokens
+
+        truncated_desc = (
+            description[:MAX_DESC_CHARS]
+            if len(description) > MAX_DESC_CHARS
+            else description
+        )
+        truncated_claims = (
+            labeled_claims[:MAX_CLAIMS_CHARS]
+            if len(labeled_claims) > MAX_CLAIMS_CHARS
+            else labeled_claims
+        )
+
+        if len(description) > MAX_DESC_CHARS:
+            truncated_desc += "\n\n[...description truncated for length...]"
+
+        prompt = phase1_prompt(truncated_claims, truncated_desc)
 
         response = self.llm.chat(
             system_prompt=prompt,
@@ -113,7 +120,14 @@ class CPCExtractor:
         )
 
         if not response:
-            return {}
+            raise RuntimeError(
+                "Phase 1 extraction failed: LLM returned empty response. "
+                "This usually means:\n"
+                "1. Ollama is not running (start with: ollama serve)\n"
+                "2. The model is not loaded (pull with: ollama pull phi4:latest)\n"
+                "3. The model is too large for your GPU/CPU (try a smaller model)\n"
+                "4. The request timed out (120B models need 5-10 minutes)"
+            )
 
         # 1. Try parsing the whole thing first
         try:

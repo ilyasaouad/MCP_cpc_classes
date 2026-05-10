@@ -12,7 +12,16 @@ from pydantic import BaseModel, field_validator
 from cpc_classification.search_cpc import CPCClassifier
 from cpc_classification.knowledge_graph import CPCKnowledgeGraph
 
-load_dotenv()
+# Load .env from the project root (parent of app/)
+env_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
+)
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+    print(f"✅ Loaded .env from {env_path}")
+else:
+    load_dotenv()  # Fallback to current directory
+    print("⚠️  No .env file found, using system environment variables")
 
 app = FastAPI(title="Patent CPC Classification API")
 
@@ -29,6 +38,12 @@ cpc_cache_dir = os.path.join(graph_cache_dir, "cpc_scheme_2026")
 
 knowledge_graph = None
 
+# Debug: Show environment variables
+skip_kg_rebuild = os.getenv("SKIP_KG_REBUILD", "NOT SET")
+skip_kg = os.getenv("SKIP_KG", "NOT SET")
+print(f"DEBUG: SKIP_KG_REBUILD = '{skip_kg_rebuild}'")
+print(f"DEBUG: SKIP_KG = '{skip_kg}'")
+
 if os.getenv("SKIP_KG") == "1":
     print("⚠️  Knowledge graph disabled (SKIP_KG=1)")
     print("   Using LLM-only classification (no semantic search)")
@@ -37,18 +52,29 @@ else:
 
     if knowledge_graph.load():
         print("✅ Knowledge graph loaded from cache")
-        # Check if source files changed
-        if knowledge_graph.check_source_changed(cpc_cache_dir):
+        # Check if source files changed (unless disabled)
+        if os.getenv("SKIP_KG_REBUILD") != "1" and knowledge_graph.check_source_changed(
+            cpc_cache_dir
+        ):
             print("📝 CPC source files changed, rebuilding graph...")
+            print("   Tip: Set SKIP_KG_REBUILD=1 to skip automatic rebuilds")
             knowledge_graph.build_from_cache(cpc_cache_dir)
             knowledge_graph.save()
             print("✅ Knowledge graph rebuilt and saved")
+        elif os.getenv("SKIP_KG_REBUILD") == "1":
+            print("   ⏩ Skipping rebuild check (SKIP_KG_REBUILD=1)")
     else:
-        print("🔨 Building knowledge graph from CPC cache files...")
-        print("   This may take 10-15 minutes on first run...")
-        print("   Tip: Copy pre-built cache files from Colab to skip this step")
-        print("   Or: Set KG_SECTIONS=G,H in .env for faster build")
-        print("   Or: Set SKIP_KG=1 to disable knowledge graph entirely")
+        # Check if we have JSON cache files or XML files
+        json_files = [
+            f
+            for f in os.listdir(cpc_cache_dir)
+            if f.startswith("cpc-cache-") and f.endswith(".json")
+        ]
+        xml_files = [
+            f
+            for f in os.listdir(cpc_cache_dir)
+            if f.startswith("cpc-scheme-") and f.endswith(".xml")
+        ]
 
         kg_sections = os.getenv("KG_SECTIONS", "")
         if kg_sections:
@@ -58,9 +84,30 @@ else:
             sections = None
             print("   Building all sections A-Z (full mode)")
 
-        knowledge_graph.build_from_cache(cpc_cache_dir, sections=sections)
-        knowledge_graph.save()
-        print("✅ Knowledge graph built and saved")
+        if json_files:
+            print("🔨 Building knowledge graph from CPC JSON cache files...")
+            print("   This may take 10-15 minutes on first run...")
+            print("   Tip: Copy pre-built cache files from Colab to skip this step")
+            print("   Or: Set KG_SECTIONS=G,H in .env for faster build")
+            print("   Or: Set SKIP_KG=1 to disable knowledge graph entirely")
+            knowledge_graph.build_from_cache(cpc_cache_dir, sections=sections)
+        elif xml_files:
+            print("🔨 Building knowledge graph from CPC XML scheme files...")
+            print("   This may take 30-60 minutes depending on sections...")
+            print(
+                "   Tip: Set KG_SECTIONS=G,H in .env for faster build (computing/telecom only)"
+            )
+            print("   Or: Set SKIP_KG=1 to disable knowledge graph entirely")
+            knowledge_graph.build_from_xml(cpc_cache_dir, sections=sections)
+        else:
+            print("❌ No CPC data files found in", cpc_cache_dir)
+            print("   Expected: cpc-cache-*.json or cpc-scheme-*.xml files")
+            print("   Continuing without knowledge graph...")
+            knowledge_graph = None
+
+        if knowledge_graph:
+            knowledge_graph.save()
+            print("✅ Knowledge graph built and saved")
 
 # Instantiate classifier with or without knowledge graph
 classifier = CPCClassifier(model_name=LLM_MODEL, knowledge_graph=knowledge_graph)
@@ -88,48 +135,114 @@ class ClassifyRequest(BaseModel):
         return stripped
 
 
+# ── Root route ──────────────────────────────────────────
+@app.get("/")
+def root():
+    return {
+        "name": "Patent CPC Classification API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": {
+            "classify": {
+                "path": "/classify",
+                "method": "POST",
+                "description": "Classify patent text into CPC codes",
+            },
+            "health": {
+                "path": "/health",
+                "method": "GET",
+                "description": "Check system health (Ollama, KG, etc.)",
+            },
+        },
+        "status": "running",
+    }
+
+
+# ── Health check endpoint ──────────────────────────────────────────
+@app.get("/health")
+def health_check():
+    """
+    Check system health: Ollama LLM, Knowledge Graph, and model availability.
+    """
+    import urllib.request
+    import urllib.error
+    import json
+
+    # Check Ollama
+    ollama_status = {"available": False, "models": [], "error": None}
+    try:
+        req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                body = json.loads(resp.read().decode("utf-8"))
+                models = body.get("models", [])
+                ollama_status = {
+                    "available": True,
+                    "models": [m.get("name", "") for m in models],
+                    "error": None,
+                }
+    except Exception as e:
+        ollama_status["error"] = str(e)
+
+    # Check if configured model is available
+    model_available = LLM_MODEL in ollama_status.get("models", [])
+
+    # Check Knowledge Graph
+    kg_status = {
+        "loaded": knowledge_graph is not None,
+        "embeddings": (
+            knowledge_graph.embeddings is not None if knowledge_graph else False
+        ),
+        "nodes": (knowledge_graph.graph.number_of_nodes() if knowledge_graph else 0),
+    }
+
+    overall_healthy = ollama_status["available"] and model_available
+
+    return {
+        "status": "healthy" if overall_healthy else "degraded",
+        "ollama": ollama_status,
+        "configured_model": LLM_MODEL,
+        "model_available": model_available,
+        "knowledge_graph": kg_status,
+        "recommendations": []
+        if overall_healthy
+        else [
+            "Start Ollama: ollama serve",
+            f"Pull model: ollama pull {LLM_MODEL}",
+            "Or set LLM_MODEL in .env to an available model",
+            "Or set SKIP_KG=1 if you don't need knowledge graph",
+        ],
+    }
+
+
 # ── Main endpoint (issues 1, 2, 8) ──────────────────────────────────────────
 @app.post("/classify")
 def classify(req: ClassifyRequest):
     """
     Classify patent text into CPC codes.
 
-    Improved Pipeline (addresses weaknesses W1-W8):
-        Phase 1  — LLM extraction with section-aware term weighting,
-                   claim type analysis (method vs apparatus), and
-                   soft class hypotheses with confidence scores
-        Phase 1b — Probabilistic domain inference (replaces hardcoded injection)
-        Phase 2  — XML expansion + improved TF-IDF scoring with:
-                   - Section-aware term weights
-                   - Probabilistic domain boosting (default 1.2x for unknown)
-                   - Term-density guard for specificity bonus
-                   - Score margin calculation for confidence level
-        Phase 3  — Ranking by composite score
-        Phase 5  — Multi-pass validation (one candidate per prompt):
-                   - Function alignment check
-                   - Context alignment check
-                   - Visual bias detection
-                   - Method vs apparatus verification
-                   - Score margin awareness
-        Phase 6  — Per-claim reconciliation (removes rejected codes,
-                   replaces with validated alternatives)
-        Phase 7  — Final consistency check (coherence of selected codes)
-
-    Output includes:
-        - premier: Single best validated CPC class
-        - per_claim: Claim-by-claim classification mapping
-        - phase5: Validation results with filtered candidates and rejection reasons
-        - phase7: Consistency assessment
-
-    Optional claims field allows prioritizing claim terms in Phase 1.
+    Supports two modes:
+    1. Normal mode: text = patent description (uses LLM for Phase 1)
+    2. Manual Phase 1 mode: text starts with "MANUAL_PHASE1:" followed by JSON
+       (bypasses LLM, uses provided Phase 1 data directly)
     """
     try:
-        # Combine description and claims if claims are provided
-        full_text = req.text
-        if req.claims:
-            full_text = f"DESCRIPTION:\n{req.text}\n\nCLAIMS:\n{req.claims}"
+        # Check for manual Phase 1 mode
+        if req.text.startswith("MANUAL_PHASE1:"):
+            import json
 
-        result = classifier.classify(full_text)
+            manual_json = req.text[len("MANUAL_PHASE1:") :]
+            manual_phase1 = json.loads(manual_json)
+
+            # Run pipeline starting from Phase 2 with manual Phase 1
+            result = classifier.classify_from_phase1(manual_phase1)
+        else:
+            # Combine description and claims if claims are provided
+            full_text = req.text
+            if req.claims:
+                full_text = f"DESCRIPTION:\n{req.text}\n\nCLAIMS:\n{req.claims}"
+
+            result = classifier.classify(full_text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

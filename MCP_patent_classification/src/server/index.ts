@@ -6,6 +6,16 @@ import { randomUUID } from "crypto";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { Agent, setGlobalDispatcher } from "undici";
+
+// Increase timeouts for global fetch (undici)
+// This prevents HeadersTimeoutError (default 30s) when backend is slow
+const agent = new Agent({
+  headersTimeout: 600000, // 10 minutes
+  bodyTimeout: 600000,    // 10 minutes
+  connectTimeout: 60000   // 1 minute
+});
+setGlobalDispatcher(agent);
 
 const app = express();
 app.use(express.json());
@@ -41,11 +51,17 @@ app.post("/mcp", async (req: Request, res: Response) => {
       console.log("🔥 classify_patent called");
 
       try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 minutes
+
         const response = await fetch("http://localhost:8000/classify", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text }),
+          signal: controller.signal,
         });
+
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
           throw new Error(`FastAPI error: ${response.status}`);
@@ -104,11 +120,17 @@ app.post("/cpc/classify", async (req: Request, res: Response) => {
   try {
     const { text } = req.body;
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 minutes
+
     const response = await fetch("http://localhost:8000/classify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
       throw new Error(`FastAPI error: ${response.status}`);

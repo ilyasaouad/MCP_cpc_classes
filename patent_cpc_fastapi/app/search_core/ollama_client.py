@@ -31,7 +31,7 @@ class OllamaClient:
         self,
         model_name: str = "gpt-oss:120b-cloud",
         base_url: str = "http://localhost:11434",
-        timeout: int = 300,
+        timeout: int = 180,
     ):
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
@@ -98,7 +98,7 @@ class OllamaClient:
             "model": self.model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_message},
+                {"role": "user", "content": user_message},
             ],
             "stream": False,
             "options": {
@@ -124,13 +124,23 @@ class OllamaClient:
                 f"Could not reach Ollama at {self.base_url}. "
                 f"Is Ollama running? Detail: {e}"
             ) from e
+        except TimeoutError:
+            raise RuntimeError(
+                f"Ollama request timed out after {self.timeout} seconds. "
+                f"This usually means:\n"
+                f"1. The model '{self.model_name}' is downloading (first run)\n"
+                f"2. The model is loading into memory (takes 30-120s)\n"
+                f"3. Ollama is not responding\n\n"
+                f"Fixes:\n"
+                f"- Wait for download to complete (check ollama logs)\n"
+                f"- Use a smaller model: LLM_MODEL=phi4:latest\n"
+                f"- Use Manual Phase 1 mode (no LLM needed)"
+            )
 
         try:
             body = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise RuntimeError(
-                f"Ollama returned non-JSON response: {raw[:200]}"
-            ) from e
+            raise RuntimeError(f"Ollama returned non-JSON response: {raw[:200]}") from e
 
         # Record token usage
         self._record_usage(body)
@@ -145,6 +155,42 @@ class OllamaClient:
             raise RuntimeError(
                 f"Unexpected Ollama response structure: {str(body)[:300]}"
             )
+
+    def is_available(self) -> bool:
+        """
+        Check if the Ollama server is reachable.
+
+        Returns
+        -------
+        bool
+            True if the server responds, False otherwise.
+        """
+        try:
+            endpoint = f"{self.base_url}/api/tags"
+            request = urllib.request.Request(endpoint, method="GET")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+    def is_model_available(self) -> bool:
+        """
+        Check if the configured model is present on the Ollama server.
+
+        Returns
+        -------
+        bool
+            True if the model exists locally, False otherwise.
+        """
+        try:
+            endpoint = f"{self.base_url}/api/tags"
+            request = urllib.request.Request(endpoint, method="GET")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                models = body.get("models", [])
+                return any(m.get("name") == self.model_name for m in models)
+        except Exception:
+            return False
 
     def embeddings(self, text: str, model: str = "nomic-embed-text") -> list[float]:
         """

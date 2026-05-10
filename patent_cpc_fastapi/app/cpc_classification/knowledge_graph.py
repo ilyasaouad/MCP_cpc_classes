@@ -64,6 +64,13 @@ class CPCKnowledgeGraph:
         # File hash for change detection
         self.source_hash = ""
 
+        # BM25 index for hybrid retrieval
+        self.bm25_index = None
+        self.bm25_index_path = os.path.join(cache_dir, "cpc_bm25_index.pkl")
+
+        # Cross-encoder for reranking
+        self.cross_encoder = None
+
         logger.info("CPCKnowledgeGraph initialized (cache_dir: %s)", cache_dir)
 
     def _get_model(self) -> SentenceTransformer:
@@ -73,6 +80,124 @@ class CPCKnowledgeGraph:
             self.model = SentenceTransformer(self.model_name)
             logger.info("Model loaded successfully")
         return self.model
+
+    def build_from_xml(
+        self,
+        cpc_xml_dir: str,
+        sections: Optional[List[str]] = None,
+    ):
+        """
+        Build graph directly from CPC scheme XML files.
+
+        Args:
+            cpc_xml_dir: Directory containing cpc-scheme-*.xml files
+            sections: List of sections to build (e.g., ['G', 'H'] for computing/telecom)
+                     None = all sections
+        """
+        import glob
+        from lxml import etree as ET
+
+        logger.info("Building knowledge graph from XML files in %s", cpc_xml_dir)
+
+        # Find all XML files
+        xml_files = glob.glob(os.path.join(cpc_xml_dir, "cpc-scheme-*.xml"))
+
+        if sections:
+            xml_files = [
+                f
+                for f in xml_files
+                if any(
+                    os.path.basename(f).startswith(f"cpc-scheme-{s}") for s in sections
+                )
+            ]
+            logger.info("Filtered to sections %s: %d files", sections, len(xml_files))
+        else:
+            logger.info("Found %d XML files", len(xml_files))
+
+        if not xml_files:
+            logger.error("No XML files found!")
+            return
+
+        all_subgroups = []
+        for i, xml_file in enumerate(xml_files):
+            try:
+                subgroups = self._parse_xml_file(xml_file)
+                all_subgroups.extend(subgroups)
+                if (i + 1) % 50 == 0 or i == len(xml_files) - 1:
+                    logger.info(
+                        "  Parsed %d/%d files (%d subgroups)",
+                        i + 1,
+                        len(xml_files),
+                        len(all_subgroups),
+                    )
+            except Exception as e:
+                logger.warning("Failed to parse %s: %s", os.path.basename(xml_file), e)
+
+        logger.info("Total subgroups extracted: %d", len(all_subgroups))
+
+        if not all_subgroups:
+            logger.error("No subgroups extracted!")
+            return
+
+        # Build graph and embeddings
+        self._build_graph_structure(all_subgroups)
+        self._generate_embeddings()
+
+        logger.info("Knowledge graph build complete")
+        logger.info("  - Graph nodes: %d", self.graph.number_of_nodes())
+        logger.info("  - Graph edges: %d", self.graph.number_of_edges())
+        logger.info("  - Embeddings: %d", len(self.embeddings))
+
+    def _parse_xml_file(self, xml_file: str) -> List[dict]:
+        """Parse a single CPC scheme XML file."""
+        from lxml import etree as ET
+
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        subgroups = []
+
+        # NO NAMESPACE - plain element names
+        items = list(root.iter("classification-item"))
+
+        for item in items:
+            symbol_elem = item.find("classification-symbol")
+            title_elem = item.find("class-title")
+
+            if symbol_elem is None or title_elem is None:
+                continue
+
+            symbol = symbol_elem.text or ""
+
+            # Extract all text from title element
+            title = " ".join(title_elem.itertext()).strip()
+
+            if not symbol or not title:
+                continue
+
+            # Get parent chain by walking up the tree
+            parent_chain = []
+            parent = item.getparent()
+            while parent is not None and parent.tag == "classification-item":
+                parent_symbol = parent.find("classification-symbol")
+                if parent_symbol is not None and parent_symbol.text:
+                    parent_chain.insert(0, parent_symbol.text)
+                parent = parent.getparent()
+
+            # Check if allocatable (not-allocatable="false" means it IS allocatable)
+            not_alloc = item.get("not-allocatable", "false").lower() == "true"
+            is_allocatable = not not_alloc
+
+            subgroups.append(
+                {
+                    "symbol": symbol,
+                    "title": title,
+                    "level": len(parent_chain),
+                    "parent_chain": parent_chain,
+                    "is_allocatable": is_allocatable,
+                }
+            )
+
+        return subgroups
 
     def build_from_cache(
         self,
@@ -562,3 +687,165 @@ class CPCKnowledgeGraph:
             hasher.update(str(stat.st_mtime).encode())
 
         return hasher.hexdigest()
+
+    # ───────────────────────────────────────────
+    # HYBRID RETRIEVAL: BM25 + Embedding + Cross-Encoder
+    # ───────────────────────────────────────────
+
+    def init_hybrid_retrieval(self, cpc_cache_dir: str = None) -> None:
+        """
+        Initialize BM25 index and cross-encoder for hybrid retrieval.
+
+        Args:
+            cpc_cache_dir: Directory with cpc-cache-*.json files
+        """
+        if cpc_cache_dir is None:
+            # Try to infer from cache_dir
+            cpc_cache_dir = os.path.join(self.cache_dir, "cpc_scheme_2026")
+
+        # Initialize BM25 index
+        self._init_bm25(cpc_cache_dir)
+
+        # Initialize cross-encoder
+        self._init_cross_encoder()
+
+    def _init_bm25(self, cpc_cache_dir: str) -> None:
+        """Load or build BM25 index."""
+        try:
+            from .cpc_bm25_index import build_or_load_bm25_index
+
+            self.bm25_index = build_or_load_bm25_index(
+                cache_dir=cpc_cache_dir,
+                index_path=self.bm25_index_path,
+            )
+            logger.info("BM25 index ready (%d entries)", len(self.bm25_index.symbols))
+        except Exception as e:
+            logger.warning("Failed to initialize BM25 index: %s", e)
+            self.bm25_index = None
+
+    def _init_cross_encoder(self) -> None:
+        """Initialize cross-encoder for reranking."""
+        try:
+            from .cpc_cross_encoder import CPCCrossEncoder
+
+            self.cross_encoder = CPCCrossEncoder()
+            logger.info("Cross-encoder ready")
+        except Exception as e:
+            logger.warning("Failed to initialize cross-encoder: %s", e)
+            self.cross_encoder = None
+
+    def hybrid_search(
+        self,
+        text: str,
+        top_k: int = 20,
+        bm25_k: int = 200,
+        use_cross_encoder: bool = True,
+    ) -> List[Tuple[str, float]]:
+        """
+        Hybrid search: BM25 recall + semantic scoring + optional cross-encoder rerank.
+
+        Pipeline:
+        1. BM25: Retrieve top bm25_k candidates by keyword matching
+        2. Semantic: Score BM25 candidates using embeddings
+        3. Cross-encoder (optional): Rerank top 50 for highest precision
+        4. Aggregate to 3-char class level
+
+        Args:
+            text: Patent text or query
+            top_k: Number of final results
+            bm25_k: Number of candidates from BM25 recall
+            use_cross_encoder: Whether to use cross-encoder reranking
+
+        Returns:
+            List of (class_symbol, score) tuples
+        """
+        if not self.embeddings:
+            logger.warning("No embeddings available, falling back to semantic_search")
+            return self.find_classes_by_text(text, top_k=top_k)
+
+        # Step 1: BM25 recall expansion
+        bm25_candidates = []
+        if self.bm25_index:
+            bm25_results = self.bm25_index.search(text, top_k=bm25_k)
+            bm25_candidates = [symbol for symbol, _ in bm25_results]
+            logger.debug("BM25 recalled %d candidates", len(bm25_candidates))
+
+        if not bm25_candidates:
+            # Fallback to all embeddings
+            logger.debug("BM25 not available, using all embeddings")
+            return self.find_classes_by_text(text, top_k=top_k)
+
+        # Step 2: Semantic scoring on BM25 candidates only
+        candidate_scores = {}
+
+        # Get query embedding
+        model = self._get_model()
+        query_embedding = model.encode([text], convert_to_numpy=True)
+
+        for symbol in bm25_candidates:
+            if symbol in self.embeddings:
+                emb = self.embeddings[symbol].reshape(1, -1)
+                sim = cosine_similarity(query_embedding, emb)[0][0]
+                candidate_scores[symbol] = float(sim)
+
+        if not candidate_scores:
+            return []
+
+        # Step 3: Cross-encoder reranking (optional)
+        if use_cross_encoder and self.cross_encoder:
+            # Get top 50 by semantic score for reranking
+            top_semantic = sorted(
+                candidate_scores.items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )[:50]
+
+            # Prepare candidates with titles
+            rerank_candidates = []
+            for symbol, _ in top_semantic:
+                title = self._get_symbol_title(symbol)
+                if title:
+                    rerank_candidates.append((symbol, title))
+
+            if rerank_candidates:
+                reranked = self.cross_encoder.rerank(text, rerank_candidates, top_k=50)
+
+                # Blend semantic and cross-encoder scores
+                rerank_dict = {s: score for s, score in reranked}
+                for symbol, sem_score in candidate_scores.items():
+                    if symbol in rerank_dict:
+                        # Weighted blend: 60% semantic, 40% cross-encoder
+                        candidate_scores[symbol] = (
+                            0.6 * sem_score + 0.4 * rerank_dict[symbol]
+                        )
+
+        # Step 4: Aggregate to 3-char class level
+        class_scores = {}
+        class_counts = {}
+
+        for symbol, score in candidate_scores.items():
+            prefix3 = symbol[:3] if len(symbol) >= 3 else symbol
+
+            if prefix3 not in class_scores:
+                class_scores[prefix3] = 0
+                class_counts[prefix3] = 0
+
+            class_scores[prefix3] += score
+            class_counts[prefix3] += 1
+
+        # Average by count
+        for prefix in class_scores:
+            class_scores[prefix] /= class_counts[prefix]
+
+        # Return top-k
+        sorted_classes = sorted(class_scores.items(), key=lambda x: x[1], reverse=True)
+
+        return sorted_classes[:top_k]
+
+    def _get_symbol_title(self, symbol: str) -> str:
+        """Get title for a symbol from graph or symbol_texts."""
+        # Try graph first
+        if symbol in self.graph.nodes:
+            return self.graph.nodes[symbol].get("title", "")
+        # Fallback to symbol_texts
+        return self.symbol_texts.get(symbol, "")

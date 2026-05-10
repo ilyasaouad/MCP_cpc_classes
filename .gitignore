@@ -1,45 +1,100 @@
-# General exclusions
+# ============================================================
+# GENERAL EXCLUSIONS
+# ============================================================
 **/.DS_Store
-**/*.pyc
 **/Thumbs.db
+**/*.swp
 **/.vscode/
-**/.ruff_cache/
+**/.idea/
 
-# Python
+# ============================================================
+# PYTHON
+# ============================================================
 **/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
 **/.venv/
-**/.env
+**/venv/
+**/env/
 
-# Node.js
+# ============================================================
+# NODE.JS
+# ============================================================
 **/node_modules/
 **/dist/
 
-# Logs
+# ============================================================
+# LOGS & TEMP FILES
+# ============================================================
 **/*.log
+**/ollama_response.txt
+**/nul
 
-# Other projects in this directory (not part of the repo)
+# ============================================================
+# ENVIRONMENT & SECRETS
+# ============================================================
+**/.env
+**/.env.local
+**/.env.*.local
+
+# ============================================================
+# JUPYTER
+# ============================================================
+**/.ipynb_checkpoints/
+**/*.ipynb_checkpoints
+
+# ============================================================
+# LARGE MODEL/DATA FILES
+# ============================================================
+*.pkl
+*.bin
+*.pt
+*.pth
+*.h5
+*.onnx
+*.safetensors
+
+# ============================================================
+# VECTOR DATABASES (generated at runtime)
+# ============================================================
+**/.chroma/
+**/chroma_db/
+
+# ============================================================
+# CPC RESOURCES (large downloaded data)
+# ============================================================
+/patent_cpc_fastapi/app/cpc_classification/resources/cpc_scheme_2026/*.xml
+/patent_cpc_fastapi/app/cpc_classification/resources/cpc_scheme_2026/*.json
+
+# ============================================================
+# OTHER PROJECTS (not part of this repo)
+# ============================================================
 /patent_application_anlayse_langgraph/
 /patent_document_analyse/
 
-# MCP_patent_classification exclusions
+# ============================================================
+# PROJECT-SPECIFIC EXCLUSIONS
+# ============================================================
+
+# MCP_patent_classification
 /MCP_patent_classification/node_modules/
 /MCP_patent_classification/dist/
 /MCP_patent_classification/.env
 /MCP_patent_classification/*.log
 
-# patent_cpc_fastapi exclusions
+# patent_cpc_fastapi
 /patent_cpc_fastapi/.venv/
 /patent_cpc_fastapi/__pycache__/
 /patent_cpc_fastapi/app/__pycache__/
 /patent_cpc_fastapi/app/**/*.pyc
 /patent_cpc_fastapi/.ruff_cache/
 /patent_cpc_fastapi/.env
-/patent_cpc_fastapi/app/cpc_classification/resources/cpc_scheme_2026/*.xml
-/patent_cpc_fastapi/app/cpc_classification/resources/cpc_scheme_2026/*.json
 /patent_cpc_fastapi/app/cpc_classification/resources/chroma_db/
 /patent_cpc_fastapi/ollama_response.txt
 
-# cpc_client exclusions
+# cpc_client
 /cpc_client/.venv/
 /cpc_client/__pycache__/
 /cpc_client/.ruff_cache/

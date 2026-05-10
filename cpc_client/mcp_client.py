@@ -28,7 +28,7 @@ class CPCRestClient:
         payload = {"text": text}
 
         try:
-            response = requests.post(url, json=payload, timeout=120)
+            response = requests.post(url, json=payload, timeout=240)
             response.raise_for_status()
             return response.json()
 
@@ -42,7 +42,7 @@ class CPCRestClient:
             }
         except requests.exceptions.Timeout:
             return {
-                "error": "Request timed out after 120 seconds. The LLM may still be processing.",
+                "error": "Request timed out after 240 seconds (4 minutes). The LLM may still be processing. Try using Manual Phase 1 mode.",
                 "cpc": [],
             }
         except requests.RequestException as e:
@@ -59,7 +59,7 @@ class CPCRestClient:
         payload = {"text": text, "claims": claims}
 
         try:
-            response = requests.post(url, json=payload, timeout=120)
+            response = requests.post(url, json=payload, timeout=240)
             response.raise_for_status()
             return response.json()
 
@@ -73,7 +73,7 @@ class CPCRestClient:
             }
         except requests.exceptions.Timeout:
             return {
-                "error": "Request timed out after 120 seconds. The LLM may still be processing.",
+                "error": "Request timed out after 240 seconds (4 minutes). The LLM may still be processing. Try using Manual Phase 1 mode.",
                 "cpc": [],
             }
         except requests.RequestException as e:

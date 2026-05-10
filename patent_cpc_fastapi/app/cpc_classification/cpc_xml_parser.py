@@ -215,7 +215,10 @@ class CPCXMLParser:
             return []
 
     def expand_classes(
-        self, class_codes: List[str], include_non_allocatable: bool = False
+        self,
+        class_codes: List[str],
+        include_non_allocatable: bool = False,
+        allowed_roots: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Expand a list of broad class codes to all their subgroups.
@@ -223,12 +226,19 @@ class CPCXMLParser:
         Args:
             class_codes: List of class codes from Phase 1 (e.g., ['G06N', 'G06F'])
             include_non_allocatable: If False, filter out codes that cannot be assigned
+            allowed_roots: Optional list of CPC family prefixes (e.g., ['G06', 'G06N', 'H04'])
+                          If provided, only return subgroups that start with any of these prefixes.
 
         Returns:
             Flat list of all subgroups with full titles and hierarchy context
         """
         all_candidates = []
         seen_symbols = set()
+
+        # Build prefix tuple for fast filtering
+        prefix_tuple = None
+        if allowed_roots:
+            prefix_tuple = tuple(allowed_roots)
 
         for code in class_codes:
             subgroups = self.parse_file(code)
@@ -244,6 +254,11 @@ class CPCXMLParser:
                 # Skip non-allocatable unless requested
                 if not include_non_allocatable and not sg["is_allocatable"]:
                     continue
+
+                # Filter by allowed_roots if specified
+                if prefix_tuple is not None:
+                    if not symbol.startswith(prefix_tuple):
+                        continue
 
                 all_candidates.append(sg)
 
