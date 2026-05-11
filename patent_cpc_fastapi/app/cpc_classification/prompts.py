@@ -160,6 +160,22 @@ explicitly reused in claims or summary.
 
 ---
 
+STEP 0 — INPUT ANALYSIS
+
+First, determine if you have a complete description or just partial claims:
+
+A. If CLAIMS are provided but DESCRIPTION is brief/empty:
+   - Focus almost entirely on the claims for understanding
+   - The system_context should describe what the claims DIRECTLY describe
+   - If claims mention "program code generation" for "simulation" → system_context = "software development tools" or "code generation systems" (NOT agricultural machinery)
+   - BE CAREFUL: "application" in "simulating an application" means software application, NOT an agricultural/industrial machine
+   - The word "application" alone is insufficient to determine domain - look at surrounding context
+
+B. If full DESCRIPTION is provided:
+   - Use the full patent text as usual
+
+---
+
 STEP 1 — TECHNICAL UNDERSTANDING
 
 Extract:

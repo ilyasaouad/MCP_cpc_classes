@@ -11,7 +11,7 @@ Usage:
 """
 
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -258,9 +258,15 @@ class CPCFamilyRouter:
         self.min_score_threshold = min_score_threshold
         self.taxonomy = CPCDomainTaxonomy()
 
-    def route(self, phase1_data: Dict[str, Any]) -> Dict[str, Any]:
+    def route(
+        self, phase1_data: Dict[str, Any], phase15_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Route patent to top CPC families.
+
+        Args:
+            phase1_data: Output from Phase 1
+            phase15_data: Optional output from Phase 1.5 (invention role)
 
         Returns dict with:
             - families: List of 3-char CPC families
@@ -275,15 +281,17 @@ class CPCFamilyRouter:
             logger.warning(
                 "Knowledge graph not available, using domain signal fallback"
             )
-            return self._route_from_domain_analysis(phase1_data)
+            return self._route_from_domain_analysis(phase1_data, phase15_data)
 
         try:
-            return self._route_from_embeddings(phase1_data)
+            return self._route_from_embeddings(phase1_data, phase15_data)
         except Exception as e:
             logger.warning("Embedding routing failed: %s, using fallback", e)
-            return self._route_from_domain_analysis(phase1_data)
+            return self._route_from_domain_analysis(phase1_data, phase15_data)
 
-    def _route_from_embeddings(self, phase1_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _route_from_embeddings(
+        self, phase1_data: Dict[str, Any], phase15_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Route using knowledge graph embeddings with modality-aware scoring."""
         technical_object = phase1_data.get("technical_object", "")
         core_function = phase1_data.get("core_function", "")
@@ -311,6 +319,17 @@ class CPCFamilyRouter:
             if score >= self.min_score_threshold:
                 combined_scores[family] = combined_scores.get(family, 0) + score * 0.4
 
+        # Apply role-based scoring from Phase 1.5
+        if phase15_data and phase15_data.get("role"):
+            from .cpc_role_classifier import apply_role_scoring
+
+            combined_scores = apply_role_scoring(
+                combined_scores, phase15_data["role"], phase1_data
+            )
+            logger.info(
+                "Phase 2A: Applied role-based scoring for role=%s", phase15_data["role"]
+            )
+
         # Apply hard domain constraints (GUARDRAILS)
         combined_scores = self._apply_hard_constraints(phase1_data, combined_scores)
 
@@ -320,7 +339,7 @@ class CPCFamilyRouter:
         return self._select_families(combined_scores, phase1_data, "embedding")
 
     def _route_from_domain_analysis(
-        self, phase1_data: Dict[str, Any]
+        self, phase1_data: Dict[str, Any], phase15_data: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Route using domain signal analysis with purpose/tool distinction.
@@ -420,6 +439,17 @@ class CPCFamilyRouter:
 
         # Apply co-occurrence rules
         family_scores = self._apply_cooccurrence_rules(detected_domains, family_scores)
+
+        # Apply role-based scoring from Phase 1.5
+        if phase15_data and phase15_data.get("role"):
+            from .cpc_role_classifier import apply_role_scoring
+
+            family_scores = apply_role_scoring(
+                family_scores, phase15_data["role"], phase1_data
+            )
+            logger.info(
+                "Phase 2A (domain): Applied role=%s for scoring", phase15_data["role"]
+            )
 
         # Apply hard domain constraints (GUARDRAILS)
         family_scores = self._apply_hard_constraints(phase1_data, family_scores)

@@ -1,0 +1,916 @@
+"""
+cpc_layer_decomposer.py - Phase 2A: CPC Layer Decomposition
+
+Replaces family routing with multi-layer decomposition.
+Each technical layer of the invention independently maps to CPC.
+
+LAYER MODEL:
+- Layer A (Application): What system is for → B60W, B60R, A61B, etc.
+- Layer B (Data/Reasoning): How knowledge is represented → G06F16, G06F40
+- Layer C (Interaction): User interface → G10L, G06F40, G06N
+- Layer D (Control): System logic orchestration → G05B
+
+KEY PRINCIPLES:
+1. NO collapsing layers into single family
+2. NO cross-layer penalties
+3. Each layer gets independent CPC candidates
+4. Soft relationship graph (no forced hierarchy)
+
+Usage:
+    decomposer = CPCLayerDecomposer(knowledge_graph)
+    layers = decomposer.decompose(phase1_data, phase15_data)
+    # Returns: {"layers": {...}, "primary_layer": "...", "relationships": {...}}
+"""
+
+import logging
+from typing import Dict, List, Any, Optional, Set
+from collections import defaultdict
+
+logger = logging.getLogger(__name__)
+
+
+# Layer definitions with their domain mappings
+LAYER_DEFINITIONS = {
+    "application": {
+        "name": "Application Layer",
+        "description": "What the system is FOR - the domain/purpose",
+        "keywords": [
+            # DOMAIN-SPECIFIC keywords (not generic computing)
+            "vehicle",
+            "driving",
+            "automotive",
+            "car",
+            "transport",
+            "medical",
+            "healthcare",
+            "diagnosis",
+            "patient",
+            "agricultural",
+            "farming",
+            "crop",
+            "livestock",
+            "industrial",
+            "manufacturing",
+            "factory",
+            "energy",
+            "power grid",
+            "financial",
+            "banking",
+            "trading",
+            # REMOVED: "simulation", "program", "code" - these are too generic for software inventions
+            # REMOVED: "machine" (ambiguous - could be ML or mechanical)
+        ],
+        "cpc_families": ["B60", "A61", "A01", "B23", "E21", "G06Q", "H02"],
+        "cpc_patterns": [
+            "B60W",
+            "B60R",
+            "B60L",
+            "B60T",
+            "B60N",
+            "A61B",
+            "A61C",
+            "A61F",
+            "A61H",
+            "A61J",
+            "A01B",
+            "A01C",
+            "A01D",
+            "A01G",
+            "A01K",
+        ],
+    },
+    "pure_software": {
+        "name": "Pure Software / Generic Computing Layer",
+        "description": "Software systems with no specific domain - generic computing, LLM, code generation",
+        "keywords": [
+            # Pure software / computing keywords
+            "llm",
+            "large language model",
+            "code generation",
+            "program code",
+            "natural language",
+            "prompt engineering",
+            "artificial intelligence",
+            "generative ai",
+            "chatbot",
+            "text generation",
+            "dialog",
+            "conversation",
+            "nlp",
+            "text processing",
+            "software platform",
+        ],
+        "cpc_families": ["G06F40", "G06N", "G06F", "G06K", "G10L"],
+        "cpc_patterns": [
+            "G06F40/30",
+            "G06F40/35",
+            "G06F40/40",
+            "G06N3/08",
+            "G06N3/04",
+            "G06F8/",
+            "G10L15/",
+        ],
+    },
+    "data_reasoning": {
+        "name": "Data & Reasoning Layer",
+        "description": "How knowledge/data is represented, stored, queried",
+        "keywords": [
+            "graph database",
+            "knowledge graph",
+            "SPARQL",
+            "query",
+            "data storage",
+            "data retrieval",
+            "database",
+            "information retrieval",
+            "semantic search",
+            "ontology",
+            "entity",
+            "relationship",
+            "middleware",
+            "API",
+            "interface",
+            "data model",
+            "schema",
+            "triple",
+        ],
+        "cpc_families": ["G06F16", "G06F18", "G06F40", "G06F19"],
+        "cpc_patterns": [
+            "G06F16/9038",
+            "G06F16/9021",
+            "G06F16/9031",  # DB operations
+            "G06F40/30",
+            "G06F40/35",  # Query processing
+            "G06F18/24",
+            "G06F18/2431",  # Graph operations
+        ],
+    },
+    "interaction": {
+        "name": "Interaction Layer",
+        "description": "User/system interaction - speech, NLP, display",
+        "keywords": [
+            "speech",
+            "voice",
+            "audio",
+            "speaker",
+            "microphone",
+            "natural language",
+            "NLP",
+            "text",
+            "chatbot",
+            "LLM",
+            "large language model",
+            "text generation",
+            "speech recognition",
+            "speech synthesis",
+            "dialog",
+            "utterance",
+            "conversation",
+            "display",
+            "visualization",
+            "user interface",
+        ],
+        "cpc_families": ["G10L", "G06F40", "G06N", "G06K"],
+        "cpc_patterns": [
+            "G10L15/22",
+            "G10L17/22",
+            "G10L21/10",  # Speech
+            "G06F40/30",
+            "G06F40/35",
+            "G06F40/40",  # NLP/text
+            "G06N3/08",
+            "G06N3/04",  # Neural networks (secondary)
+        ],
+    },
+    "control": {
+        "name": "Control Orchestration Layer",
+        "description": "System logic, scheduling, coordination, workflow",
+        "keywords": [
+            "control",
+            "orchestration",
+            "scheduling",
+            "coordination",
+            "workflow",
+            "pipeline",
+            "state machine",
+            "control system",
+            "automation",
+            "feedback",
+            "event handling",
+            "dispatching",
+            "routing",
+            "state",
+            "mode",
+            "phase",
+            "sequence",
+            "multi-component",
+            "multi-system",
+            "interaction",
+        ],
+        "cpc_families": ["G05B", "G05D", "G05B19"],
+        "cpc_patterns": [
+            "G05B13/027",
+            "G05B15/00",
+            "G05B19/047",
+            "G05D1/02",
+            "G05D1/00",  # Vehicle control
+        ],
+    },
+}
+
+
+# Layer relationship graph (soft, bidirectional)
+LAYER_RELATIONSHIPS = {
+    "application": {
+        "controls": ["control"],
+        "uses_data": ["data_reasoning"],
+        "interface": ["interaction"],
+    },
+    "data_reasoning": {
+        "queried_by": ["interaction", "control"],
+        "provides_to": ["application"],
+    },
+    "interaction": {
+        "feeds_to": ["data_reasoning"],
+        "receives_from": ["application"],
+        "powered_by": ["control"],
+    },
+    "control": {
+        "orchestrates": ["application", "data_reasoning", "interaction"],
+    },
+}
+
+
+# AI as TOOL vs AI as CORE METHOD distinction
+AI_ROLE_CONFIG = {
+    "as_tool": {
+        "description": "AI used for speech, vision, NLP support",
+        "weight": 0.5,
+        "layers": ["interaction", "data_reasoning"],
+        "cpc_families": ["G10L", "G06F40", "G06K"],
+    },
+    "as_core_method": {
+        "description": "Invention modifies model behavior itself",
+        "weight": 1.5,
+        "layers": ["data_reasoning"],
+        "cpc_families": ["G06N3", "G06N20", "G06T3"],
+        "strong_signals": [
+            "weight clipping",
+            "weight quantization",
+            "model compression",
+            "pruning",
+            "distillation",
+            "architecture change",
+            "layer design",
+            "parameter optimization",
+            "training method",
+            "optimization algorithm",
+        ],
+    },
+}
+
+
+# Mandatory Domain Anchor mapping
+# High-confidence primary domains map to required CPC families
+DOMAIN_ANCHOR_MAP = {
+    "natural language processing": {"families": ["G10L", "G06F40"], "boost": 2.0},
+    "speech recognition": {"families": ["G10L"], "boost": 2.0},
+    "speech understanding": {"families": ["G10L", "G06F40"], "boost": 2.0},
+    "vehicle control": {"families": ["B60W", "G05B"], "boost": 2.0},
+    "automotive control": {"families": ["B60W", "G05B"], "boost": 2.0},
+    "driving control": {"families": ["B60W", "G05D"], "boost": 2.0},
+    "autonomous driving": {"families": ["B60W", "G05D"], "boost": 2.0},
+    "artificial intelligence": {"families": ["G06N", "G06F40"], "boost": 1.5},
+    "machine learning": {"families": ["G06N"], "boost": 1.5},
+    "neural network": {"families": ["G06N"], "boost": 1.5},
+    "deep learning": {"families": ["G06N"], "boost": 1.5},
+    "computer vision": {"families": ["G06V", "G06T"], "boost": 1.5},
+    "image processing": {"families": ["G06T"], "boost": 1.5},
+    "medical imaging": {"families": ["A61B", "G06T"], "boost": 1.5},
+    "data processing": {"families": ["G06F"], "boost": 1.3},
+    "database": {"families": ["G06F16"], "boost": 1.5},
+    "knowledge graph": {"families": ["G06F16", "G06F40"], "boost": 1.5},
+}
+
+
+# AI + Automotive co-occurrence rules
+# When invention involves BOTH AI and Automotive:
+# - Boost software layers (control, interaction)
+# - Penalize hardware layers (H02, B60Q) UNLESS hardware keywords present
+HARDWARE_KEYWORDS = [
+    "circuit",
+    "semiconductor",
+    "wiring",
+    "transistor",
+    "capacitor",
+    "inductor",
+    "pcb",
+    "printed circuit",
+    "electrical connection",
+    "power supply",
+    "battery management",
+    "motor driver",
+    "h-bridge",
+    "inverter circuit",
+]
+
+AI_KEYWORDS = [
+    "llm",
+    "large language model",
+    "neural network",
+    "artificial intelligence",
+    "machine learning",
+    "deep learning",
+    "transformer",
+    "gpt",
+    "bert",
+    "speech recognition model",
+    "nlp model",
+    "classifier",
+]
+
+AUTOMOTIVE_KEYWORDS = [
+    "vehicle",
+    "car",
+    "automotive",
+    "driving",
+    "automobile",
+    "electric vehicle",
+    "ev",
+    "battery electric",
+]
+
+
+class CPCLayerDecomposer:
+    """
+    Phase 2A (REPLACEMENT): Multi-layer CPC decomposition.
+
+    Decomposes patent into independent technical layers,
+    each mapping to its own CPC candidates.
+
+    NO collapsing, NO cross-layer penalties.
+    """
+
+    def __init__(
+        self,
+        knowledge_graph=None,
+        max_candidates_per_layer: int = 5,
+        min_layer_confidence: float = 0.15,
+    ):
+        self.knowledge_graph = knowledge_graph
+        self.max_candidates_per_layer = max_candidates_per_layer
+        self.min_layer_confidence = min_layer_confidence
+
+    def decompose(
+        self,
+        phase1_data: Dict[str, Any],
+        phase15_data: Optional[Dict[str, Any]] = None,
+        tcr_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Decompose patent into technical layers with independent CPC mapping.
+
+        Args:
+            phase1_data: Output from Phase 1
+            phase15_data: Optional output from Phase 1.5 (invention role)
+            tcr_result: Optional Technical Weight Analysis result
+                        When TCR > 2.0 (FORCE_SOFTWARE_CORE), pure_software layer
+                        is prioritized, application layer CPCs are deprioritized.
+
+        Returns:
+            Dict with:
+                - layers: Dict of layer_name -> list of CPC candidates
+                - primary_layer: The most important layer
+                - layer_scores: Per-layer confidence scores
+                - relationships: Layer relationship graph
+                - reasoning: Explanation
+        """
+        # Extract text for analysis
+        technical_object = phase1_data.get("technical_object", "").lower()
+        core_function = phase1_data.get("core_function", "").lower()
+        system_context = phase1_data.get("system_context", "").lower()
+        strategy = phase1_data.get("classification_strategy", "").lower()
+
+        terms = phase1_data.get("terms", phase1_data.get("essential_terms", []))
+        domain_signals = phase1_data.get("domain_signals", [])
+
+        combined_text = f"{technical_object} {core_function} {system_context}"
+        all_terms_text = " ".join(
+            [
+                t.get("term", "").lower() if isinstance(t, dict) else str(t).lower()
+                for t in terms
+            ]
+        )
+
+        # Detect AI role (tool vs core method)
+        ai_role = self._detect_ai_role(all_terms_text, phase15_data)
+
+        # Score each layer independently
+        layer_scores = {}
+        layer_candidates = {}
+        layer_signals = {}
+
+        for layer_name, layer_config in LAYER_DEFINITIONS.items():
+            # Score this layer independently
+            score, signals = self._score_layer(
+                combined_text + " " + all_terms_text,
+                layer_config,
+                domain_signals,
+                ai_role,
+            )
+
+            layer_scores[layer_name] = score
+            layer_signals[layer_name] = signals
+
+            # Get CPC candidates for this layer
+            candidates = self._get_layer_candidates(
+                layer_config,
+                signals,
+                ai_role,
+                layer_name,
+            )
+            layer_candidates[layer_name] = candidates
+
+            logger.info(
+                "Layer %s: score=%.3f, candidates=%d",
+                layer_name,
+                score,
+                len(candidates),
+            )
+
+        # ── MANDATORY DOMAIN ANCHOR CHECK (Prompt 1) ──
+        # If Phase 1 identifies high-confidence primary domain,
+        # ensure at least one associated CPC family is prioritized
+        layer_scores, anchor_log = self._apply_mandatory_domain_anchor(
+            layer_scores, layer_candidates, phase1_data
+        )
+        if anchor_log:
+            logger.info("Domain Anchor: %s", anchor_log)
+
+        # ── AI + AUTOMOTIVE CO-OCCURRENCE RULES (Prompt 1) ──
+        # When both AI and Automotive keywords present,
+        # boost software layers, demote hardware layers
+        layer_scores = self._apply_ai_automotive_rules(
+            layer_scores, all_terms_text, phase15_data
+        )
+
+        # ── TCR-BASED SOFTWARE PRIORITIZATION (NEW) ──
+        # When TCR indicates pure software invention, boost pure_software layer
+        # and filter out application-layer domain noise
+        if tcr_result:
+            force_flag = tcr_result.get("force_flag", "")
+            tcr = tcr_result.get("tcr", 1.0)
+
+            if force_flag == "FORCE_SOFTWARE_CORE":
+                logger.info(
+                    "Layer Decomposer: TCR=FORCE_SOFTWARE_CORE (%.2f). Boosting pure_software, filtering application.",
+                    tcr,
+                )
+
+                # Boost pure_software layer
+                if "pure_software" in layer_scores:
+                    layer_scores["pure_software"] = max(
+                        layer_scores["pure_software"], 0.8
+                    )
+
+                # Demote application layer (it's noise for pure software)
+                if "application" in layer_scores and layer_scores["application"] < 0.5:
+                    layer_scores["application"] = 0.0
+                    # Clear application layer candidates too
+                    if "application" in layer_candidates:
+                        layer_candidates["application"] = []
+                    logger.info(
+                        "Layer Decomposer: application layer demoted to 0 (pure software detected)",
+                    )
+
+        # Determine primary layer (highest scoring with minimum confidence)
+        primary_layer = self._determine_primary_layer(layer_scores)
+
+        # Build relationships
+        relationships = self._build_relationships(layer_scores)
+
+        # Build reasoning
+        reasoning = self._build_reasoning(
+            layer_scores, layer_candidates, primary_layer, ai_role
+        )
+
+        return {
+            "layers": layer_candidates,
+            "layer_scores": layer_scores,
+            "primary_layer": primary_layer,
+            "relationships": relationships,
+            "ai_role": ai_role,
+            "reasoning": reasoning,
+            "source": "layer_decomposition",
+        }
+
+    def _detect_ai_role(
+        self,
+        all_terms_text: str,
+        phase15_data: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Detect whether AI is the tool or the core method.
+
+        Returns: "as_tool" or "as_core_method"
+        """
+        # Check Phase 1.5 role first
+        if phase15_data:
+            role = phase15_data.get("role", "")
+            if role == "CORE_TECH":
+                return "as_core_method"
+            elif role == "SYSTEM":
+                return "as_tool"
+            elif role == "APPLICATION":
+                return "as_tool"
+
+        # Check for NN-internal signals
+        core_method_signals = AI_ROLE_CONFIG["as_core_method"]["strong_signals"]
+        has_core_method = any(sig in all_terms_text for sig in core_method_signals)
+
+        # Check for AI-as-tool signals
+        tool_signals = [
+            "using neural network",
+            "using LLM",
+            "using machine learning",
+            "applying neural network",
+            "deploying AI",
+            "classification using",
+            "detection using",
+        ]
+        has_tool_signal = any(sig in all_terms_text for sig in tool_signals)
+
+        if has_core_method:
+            return "as_core_method"
+        elif has_tool_signal:
+            return "as_tool"
+        else:
+            # Default to tool (most common)
+            return "as_tool"
+
+    def _score_layer(
+        self,
+        combined_text: str,
+        layer_config: Dict[str, Any],
+        domain_signals: List[Dict],
+        ai_role: str,
+    ) -> tuple[float, List[str]]:
+        """
+        Score a single layer independently.
+
+        Returns: (score, matching_signals)
+        """
+        score = 0.0
+        signals = []
+
+        # Score from keywords
+        keywords = layer_config.get("keywords", [])
+        for kw in keywords:
+            if kw in combined_text:
+                score += 1.0
+                signals.append(kw)
+
+        # Score from domain signals
+        for ds in domain_signals:
+            if isinstance(ds, dict):
+                name = ds.get("name", "").lower()
+                conf = ds.get("confidence", 0.5)
+                family = ds.get("cpc_family", "")
+
+                # Check if domain signal matches this layer
+                for kw in keywords:
+                    if kw in name:
+                        score += conf * 2.0
+                        signals.append(name)
+                        break
+
+                # Check if CPC family matches layer
+                if family:
+                    layer_families = layer_config.get("cpc_families", [])
+                    if any(family.startswith(f) for f in layer_families):
+                        score += conf * 2.5
+                        signals.append(f"{name} ({family})")
+
+        return score, signals
+
+    def _get_layer_candidates(
+        self,
+        layer_config: Dict[str, Any],
+        signals: List[str],
+        ai_role: str,
+        layer_name: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get CPC candidates for this layer.
+
+        Uses KG if available, otherwise uses pattern matching.
+        """
+        candidates = []
+        layer_families = layer_config.get("cpc_families", [])
+        patterns = layer_config.get("cpc_patterns", [])
+
+        # Special handling for AI
+        if layer_name == "interaction" and ai_role == "as_core_method":
+            # AI is core method, boost G06N
+            layer_families = ["G06N3", "G06N20"] + layer_families
+        elif layer_name == "interaction" and ai_role == "as_tool":
+            # AI is tool, use G06F40/G10L as primary
+            layer_families = ["G06F40", "G10L", "G06K"] + layer_families
+
+        # Add family-level candidates
+        for family in layer_families:
+            candidates.append(
+                {
+                    "symbol": family,
+                    "type": "family",
+                    "source": "layer_mapping",
+                    "confidence": 0.7,
+                }
+            )
+
+        # Add pattern-level candidates
+        for pattern in patterns:
+            candidates.append(
+                {
+                    "symbol": pattern,
+                    "type": "pattern",
+                    "source": "layer_mapping",
+                    "confidence": 0.6,
+                }
+            )
+
+        return candidates
+
+    def _determine_primary_layer(
+        self,
+        layer_scores: Dict[str, float],
+    ) -> str:
+        """Determine the primary layer (highest scoring)."""
+        if not layer_scores:
+            return "application"
+
+        # Filter by minimum confidence
+        valid_layers = {
+            k: v for k, v in layer_scores.items() if v >= self.min_layer_confidence
+        }
+
+        if not valid_layers:
+            # Return highest scoring anyway
+            return max(layer_scores.items(), key=lambda x: x[1])[0]
+
+        return max(valid_layers.items(), key=lambda x: x[1])[0]
+
+    def _build_relationships(
+        self,
+        layer_scores: Dict[str, float],
+    ) -> Dict[str, List[str]]:
+        """Build layer relationship graph based on active layers."""
+        relationships = {}
+        active_layers = {k for k, v in layer_scores.items() if v > 0}
+
+        for layer in active_layers:
+            layer_rels = []
+            if layer in LAYER_RELATIONSHIPS:
+                for rel_type, related_layers in LAYER_RELATIONSHIPS[layer].items():
+                    for related in related_layers:
+                        if related in active_layers:
+                            layer_rels.append(f"{related} ({rel_type})")
+            relationships[layer] = layer_rels
+
+        return relationships
+
+    def _build_reasoning(
+        self,
+        layer_scores: Dict[str, float],
+        layer_candidates: Dict[str, List[Dict]],
+        primary_layer: str,
+        ai_role: str,
+    ) -> str:
+        """Build human-readable reasoning."""
+        top_layers = sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+
+        scores_str = ", ".join([f"{k}={v:.2f}" for k, v in top_layers])
+
+        reasoning = (
+            f"Layer decomposition: {scores_str}. "
+            f"Primary={primary_layer}. "
+            f"AI role={ai_role}. "
+            f"Active layers: {len([v for v in layer_scores.values() if v > 0])}."
+        )
+
+        return reasoning
+
+    def _apply_mandatory_domain_anchor(
+        self,
+        layer_scores: Dict[str, float],
+        layer_candidates: Dict[str, List[Dict]],
+        phase1_data: Dict[str, Any],
+    ) -> tuple[Dict[str, float], str]:
+        """
+        MANDATORY DOMAIN ANCHOR CHECK (Prompt 1 - Family Router Fix).
+
+        If Phase 1 identifies a high-confidence Primary Technical Domain,
+        ensure at least one associated CPC family is prioritized in top results.
+
+        This prevents semantic drift into wrong CPC sections.
+
+        Returns: (adjusted_layer_scores, log_message)
+        """
+        log_messages = []
+
+        primary_domain = phase1_data.get("primary_domain", {})
+        if not primary_domain or not isinstance(primary_domain, dict):
+            return layer_scores, ""
+
+        pd_name = primary_domain.get("name", "").lower()
+        pd_conf = primary_domain.get("confidence", 0)
+        pd_cpc = primary_domain.get("cpc_class", "")
+
+        if pd_conf < 0.7:
+            return layer_scores, ""
+
+        logger.info(
+            "MANDATORY DOMAIN ANCHOR: Domain=%s (conf=%.2f), CPC=%s",
+            pd_name,
+            pd_conf,
+            pd_cpc,
+        )
+
+        for domain_pattern, anchor_config in DOMAIN_ANCHOR_MAP.items():
+            if domain_pattern in pd_name:
+                boost = anchor_config["boost"]
+                required_families = anchor_config["families"]
+
+                logger.info(
+                    "Domain anchor match: %s -> requires %s (boost=%.1f)",
+                    domain_pattern,
+                    required_families,
+                    boost,
+                )
+
+                for layer_name, candidates in layer_candidates.items():
+                    for cand in candidates:
+                        sym = cand.get("symbol", "")
+                        if any(sym.startswith(f) for f in required_families):
+                            old_score = layer_scores.get(layer_name, 0)
+                            layer_scores[layer_name] = old_score * boost
+                            log_messages.append(
+                                f"MANDATORY_ANCHOR: {layer_name} boosted {boost}x"
+                            )
+                            logger.info(
+                                "Domain anchor boost: %s score %.3f -> %.3f",
+                                layer_name,
+                                old_score,
+                                layer_scores[layer_name],
+                            )
+                            break
+                break
+
+        if pd_cpc:
+            for layer_name, candidates in layer_candidates.items():
+                for cand in candidates:
+                    sym = cand.get("symbol", "")
+                    if sym.startswith(pd_cpc[:3]):
+                        old_score = layer_scores.get(layer_name, 0)
+                        layer_scores[layer_name] = old_score * 1.5
+                        log_messages.append(f"PRIMARY_DOMAIN_BOOST: {layer_name}")
+                        logger.info(
+                            "Primary domain boost: %s score %.3f -> %.3f",
+                            layer_name,
+                            old_score,
+                            layer_scores[layer_name],
+                        )
+                        break
+
+        return layer_scores, "; ".join(log_messages)
+
+    def _apply_ai_automotive_rules(
+        self,
+        layer_scores: Dict[str, float],
+        terms_text: str,
+        phase15_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        """
+        AI + AUTOMOTIVE CO-OCCURRENCE RULES (Prompt 1).
+
+        If invention involves BOTH 'AI' and 'Automotive':
+        - Boost software layers (control, interaction)
+        - Penalize hardware layers UNLESS hardware keywords present
+
+        This prevents drift into motor switches (H02P) or signaling (B60Q).
+        """
+        terms_lower = terms_text.lower()
+
+        has_ai = any(kw in terms_lower for kw in AI_KEYWORDS)
+        has_auto = any(kw in terms_lower for kw in AUTOMOTIVE_KEYWORDS)
+        has_hardware = any(kw in terms_lower for kw in HARDWARE_KEYWORDS)
+
+        if has_ai and has_auto and not has_hardware:
+            logger.info(
+                "AI+Automotive detected: boosting software layers, soft demotion of hardware"
+            )
+
+            software_layers = {
+                "control": 1.3,
+                "interaction": 1.3,
+                "data_reasoning": 1.2,
+            }
+
+            for layer_name, boost in software_layers.items():
+                if layer_name in layer_scores:
+                    old_score = layer_scores[layer_name]
+                    layer_scores[layer_name] = old_score * boost
+                    logger.info(
+                        "AI+Auto boost: %s %.3f -> %.3f",
+                        layer_name,
+                        old_score,
+                        layer_scores[layer_name],
+                    )
+
+        return layer_scores
+
+
+def merge_layers_to_family_list(
+    layer_result: Dict[str, Any],
+    tcr_result: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """
+    Convert layer decomposition back to family list for backward compatibility.
+
+    Used by downstream phases that expect family list format.
+
+    Args:
+        layer_result: Layer decomposition result
+        tcr_result: Optional TCR analysis for filtering application layer CPCs
+                    When TCR > 2.0 (FORCE_SOFTWARE_CORE), application layer CPCs
+                    from A01, B23, F16, etc. are filtered out as irrelevant noise.
+    """
+    layers = layer_result.get("layers", {})
+    family_list = []
+    seen = set()
+
+    force_flag = None
+    if tcr_result:
+        force_flag = tcr_result.get("force_flag")
+
+    software_domains = {"G06F", "G06N", "G06K", "G06Q", "G10L", "G06V", "G05B"}
+    irrelevant_domains = {"A01", "B23", "F16", "C08", "E21", "H02"}
+
+    for layer_name, candidates in layers.items():
+        for cand in candidates:
+            sym = cand.get("symbol", "")
+            if not sym:
+                continue
+
+            # Filter application layer CPCs when TCR indicates pure software
+            if force_flag == "FORCE_SOFTWARE_CORE" and layer_name == "application":
+                # Skip non-software domains in application layer for software inventions
+                prefix_3 = sym[:3] if len(sym) >= 3 else sym
+                if prefix_3 in irrelevant_domains:
+                    logger.info(
+                        "merge_layers_to_family_list: SKIPPED %s from application layer (TCR=FORCE_SOFTWARE_CORE)",
+                        sym,
+                    )
+                    continue
+
+            if sym not in seen:
+                seen.add(sym)
+                family_list.append(sym)
+
+    return family_list[:10]
+
+
+def extract_primary_family_from_layers(
+    layer_result: Dict[str, Any],
+) -> str:
+    """Extract primary family from layer decomposition."""
+    primary_layer = layer_result.get("primary_layer", "application")
+    layers = layer_result.get("layers", {})
+
+    layer_candidates = layers.get(primary_layer, [])
+    if layer_candidates:
+        return layer_candidates[0].get("symbol", "G06F")
+
+    return "G06F"  # Default
+
+
+def get_layer_cpcs_for_expansion(
+    layer_result: Dict[str, Any],
+) -> List[str]:
+    """
+    Get flat list of all CPC symbols from all layers for XML expansion.
+
+    This is used by Phase 2B/2C for subgroup expansion.
+    """
+    cpc_list = []
+    seen = set()
+
+    layers = layer_result.get("layers", {})
+    for layer_name, candidates in layers.items():
+        for cand in candidates:
+            sym = cand.get("symbol", "")
+            if sym and sym not in seen:
+                seen.add(sym)
+                cpc_list.append(sym)
+
+    return cpc_list

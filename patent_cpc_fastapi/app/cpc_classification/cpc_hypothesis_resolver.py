@@ -1,25 +1,47 @@
 """
-cpc_hypothesis_resolver.py - Phase 5: CPC Hypothesis Resolution
+cpc_hypothesis_resolver.py - Phase 5: CPC Hypothesis Resolution + Tri-Pillar Classification
 
 Deterministic resolver that selects the best CPC hypothesis from Phase 4 output.
+Also produces a Tri-Pillar classification: Primary Function (G06F), Methodology (G06N),
+Application Domain (G05B) — by back-scanning Phase 2/3 raw candidates.
 
 KEY DESIGN:
 - NOT a free-form classifier
 - NOT validating individual CPC codes
 - IS a deterministic scorer that ranks Phase 4 hypotheses
-- LLM used ONLY for tie-breaking, not for classification
-
-Constraints:
-- MUST choose ONLY from Phase 4 hypotheses
-- MUST NOT generate new CPC codes
-- MUST select exactly 1 primary
-- Secondary is optional (max 1, only if gap < 0.25)
+- Tri-Pillar: finds highest-scoring champion per functional role
+- LLM used ONLY for tie-breaking or targeted lookups when candidates missing
 """
 
 import logging
 from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────
+# Tri-Pillar Definitions
+# ─────────────────────────────────────────────────────────────────────
+
+PILLAR_DEFINITIONS = {
+    "pillar1_goal": {
+        "label": "Primary Facet (Core Purpose)",
+        "description": "The core technical result/output — what the invention PRODUCES.",
+        "families": ["G06F", "G06Q"],
+        "fallback_family": "G06F",
+    },
+    "pillar2_method": {
+        "label": "Methodological Facet (Implementation)",
+        "description": "The AI/ML implementation strategy — how the invention WORKS.",
+        "families": ["G06N"],
+        "fallback_family": "G06N",
+    },
+    "pillar3_context": {
+        "label": "Application Facet (Domain)",
+        "description": "The target hardware/industrial environment — where the invention APPLIES.",
+        "families": ["G05B", "B60W", "A61B", "H02J"],
+        "fallback_family": "G05B",
+    },
+}
 
 
 class CPCHypothesisResolver:
@@ -37,16 +59,18 @@ class CPCHypothesisResolver:
         self,
         phase4_result: Dict[str, Any],
         phase1_data: Dict[str, Any],
+        all_raw_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        Resolve Phase 4 hypotheses into final CPC selection.
+        Resolve Phase 4 hypotheses into final CPC selection + Tri-Pillar classification.
 
         Args:
             phase4_result: Output from Phase 4 consolidation
             phase1_data: Phase 1 semantic extraction
+            all_raw_candidates: Optional Phase 2C raw scored candidates for pillar back-scanning
 
         Returns:
-            Structured output with primary, optional secondary, and decision logic
+            Structured output with primary, optional secondary, pillars, and decision logic
         """
         hypotheses = phase4_result.get("phase4_hypotheses", [])
 
@@ -60,19 +84,10 @@ class CPCHypothesisResolver:
         scored_hypotheses = []
         for hyp in hypotheses:
             scores = self._score_hypothesis(hyp, phase1_data)
-            scored_hypotheses.append(
-                {
-                    **hyp,
-                    **scores,
-                }
-            )
+            scored_hypotheses.append({**hyp, **scores})
 
         # Step 2: Rank by final_score
-        ranked = sorted(
-            scored_hypotheses,
-            key=lambda x: x["final_score"],
-            reverse=True,
-        )
+        ranked = sorted(scored_hypotheses, key=lambda x: x["final_score"], reverse=True)
 
         # Step 3: Select primary
         primary = ranked[0]
@@ -144,7 +159,104 @@ class CPCHypothesisResolver:
             result["decision_logic"]["score_gap"],
         )
 
+        # ─────────────────────────────────────────────────────────────
+        # Step 6: Tri-Pillar Resolution — back-scan raw candidates for
+        #         highest-scoring champion per functional role
+        # ─────────────────────────────────────────────────────────────
+        if all_raw_candidates:
+            result["pillars"] = self._resolve_pillars(all_raw_candidates, phase1_data)
+
         return result
+
+    def _resolve_pillars(
+        self,
+        all_raw_candidates: List[Dict[str, Any]],
+        phase1_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Find the highest-scoring CPC champion for each of the three pillars.
+
+        Back-scans the full Phase 2C raw candidate pool (pre-2D filtering).
+        For each pillar family (e.g., G06F, G06N, G05B), picks the top-scoring
+        candidate whose symbol starts with that family prefix.
+
+        Falls back to the ranked candidates from Phase 3 if no raw candidate found.
+        """
+        pillars = {}
+
+        for pillar_key, pillar_def in PILLAR_DEFINITIONS.items():
+            families = pillar_def["families"]
+            label = pillar_def["label"]
+            desc = pillar_def["description"]
+
+            # Scan raw candidates for matching family prefix
+            champion = self._find_champion_in_pool(all_raw_candidates, families)
+
+            if champion:
+                pillars[pillar_key] = {
+                    "symbol": champion.get("symbol", ""),
+                    "title": champion.get("title", ""),
+                    "score": champion.get("score", 0),
+                    "family": families[0] if families else "",
+                    "label": label,
+                    "description": desc,
+                    "source": "phase2c_back_scan",
+                }
+                logger.info(
+                    "Pillar '%s': Champion=%s (score=%.4f, source=back_scan)",
+                    pillar_key,
+                    champion.get("symbol", ""),
+                    champion.get("score", 0),
+                )
+            else:
+                # Fallback: placeholder — could trigger LLM lookup
+                fallback_family = pillar_def.get(
+                    "fallback_family", families[0] if families else ""
+                )
+                pillars[pillar_key] = {
+                    "symbol": "",
+                    "title": f"Target: {fallback_family} subclass (not found in candidate pool)",
+                    "score": 0,
+                    "family": fallback_family,
+                    "label": label,
+                    "description": desc,
+                    "source": "not_found",
+                }
+                logger.warning(
+                    "Pillar '%s': No champion found in %s families %s",
+                    pillar_key,
+                    len(all_raw_candidates),
+                    families,
+                )
+
+        standard_count = sum(
+            1 for v in pillars.values() if v.get("source") != "not_found"
+        )
+        logger.info(
+            "Phase 5 Tri-Pillar: Found %d/3 pillar champions",
+            standard_count,
+        )
+
+        return pillars
+
+    @staticmethod
+    def _find_champion_in_pool(
+        candidates: List[Dict[str, Any]],
+        families: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find the highest-scoring candidate whose symbol starts with
+        any of the given family prefixes.
+        """
+        matches = [
+            c
+            for c in candidates
+            if any(c.get("symbol", "").startswith(fam) for fam in families)
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return matches[0]
 
     def _score_hypothesis(
         self,

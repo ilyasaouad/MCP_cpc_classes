@@ -3,6 +3,7 @@ import os
 import re
 import math
 import json
+import numpy as np
 from typing import Dict, Any, Set, List, Tuple, Optional
 from collections import Counter
 
@@ -11,10 +12,18 @@ from .extracting_cpc import CPCExtractor
 from .cpc_xml_parser import CPCXMLParser
 from .knowledge_graph import CPCKnowledgeGraph
 from .cpc_family_router import CPCFamilyRouter
+from .cpc_layer_decomposer import CPCLayerDecomposer, merge_layers_to_family_list
 from .cpc_hypothesis_consolidation import CPCHypothesisConsolidator
 from .cpc_hypothesis_resolver import CPCHypothesisResolver
 from .cpc_decision_tree import CPCDecisionTreeConstraint
-from .cpc_hierarchy_engine import UniversalCPCHierarchyEngine
+from .cpc_cross_domain_validator import CrossDomainValidator
+from .cpc_role_labeling import CPCRoleLabeling
+from .cpc_role_classifier import CPCRoleClassifier, apply_role_scoring
+from .cpc_phase2d_anchor import Phase2DSubclassAnchor
+from .technical_weight_analyzer import (
+    TechnicalWeightAnalyzer,
+    apply_technical_weight_analysis,
+)
 from .prompts import (
     label_claims,
     semantic_scoring_prompt,
@@ -50,6 +59,31 @@ def _tokenize(text: str) -> Set[str]:
     """Tokenize text into normalized words."""
     words = re.findall(r"[a-zA-Z]+", text.lower())
     return {_normalize_word(w) for w in words if len(w) > 2}
+
+
+def _tokenize_with_bigrams(text: str) -> Tuple[Set[str], Set[str]]:
+    """Tokenize text into normalized unigrams AND bigrams.
+
+    Bigrams capture technical phrases like "system_prompt", "user_prompt",
+    "program_code" that anchor terms to specific technical domains.
+    Returns (unigrams, bigrams) where bigrams use '_' as delimiter.
+    """
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    normalized = [_normalize_word(w) for w in words if len(w) > 2]
+    unigrams = set(normalized)
+    bigrams = set()
+    for i in range(len(normalized) - 1):
+        big = f"{normalized[i]}_{normalized[i + 1]}"
+        bigrams.add(big)
+    return unigrams, bigrams
+
+
+def _make_term_bigrams(term: str) -> List[str]:
+    """Generate bigrams from a multi-word term (used for patent term bigram matching)."""
+    words = [_normalize_word(w) for w in term.lower().split() if len(w) > 2]
+    if len(words) < 2:
+        return []
+    return [f"{words[i]}_{words[i + 1]}" for i in range(len(words) - 1)]
 
 
 # Synonym mapping for CPC technical terms
@@ -144,6 +178,7 @@ class CPCClassifier:
         self.xml_parser = CPCXMLParser(_resolve_xml_dir())
         self.knowledge_graph = knowledge_graph
         self.family_router = CPCFamilyRouter(knowledge_graph, max_families=3)
+        self.layer_decomposer = CPCLayerDecomposer(knowledge_graph)
 
     def classify(self, text: str, claims: str = "") -> Dict[str, Any]:
 
@@ -201,6 +236,40 @@ class CPCClassifier:
             }
 
         # ─────────────────────────────
+        # PHASE 1.5: Invention Role Classification
+        # ─────────────────────────────
+        phase15_result = {}
+        try:
+            role_classifier = CPCRoleClassifier(self.llm)
+            phase15_result = role_classifier.classify_role(phase1)
+            logger.info(
+                "Phase 1.5: Role=%s (conf=%.2f)",
+                phase15_result.get("role", "UNKNOWN"),
+                phase15_result.get("confidence", 0),
+            )
+        except Exception as e:
+            logger.warning("Phase 1.5 role classification failed: %s", e)
+            phase15_result = {"role": "SYSTEM", "confidence": 0.5}
+
+        # ─────────────────────────────
+        # TECHNICAL WEIGHT ANALYSIS (NEW)
+        # ─────────────────────────────
+        tcr_result = {}
+        try:
+            tcr_analyzer = TechnicalWeightAnalyzer()
+            tcr_result = tcr_analyzer.analyze(phase1)
+            logger.info(
+                "TCR Analysis: TCR=%.3f, force_flag=%s, comp_weight=%.2f, phys_weight=%.2f",
+                tcr_result.get("tcr", 1.0),
+                tcr_result.get("force_flag", "HYBRID_INVENTION"),
+                tcr_result.get("computational_weight", 0),
+                tcr_result.get("physical_weight", 0),
+            )
+        except Exception as e:
+            logger.warning("Technical weight analysis failed: %s", e)
+            tcr_result = {"tcr": 1.0, "force_flag": "HYBRID_INVENTION"}
+
+        # ─────────────────────────────
         # Extract terms with section-aware importance
         # ─────────────────────────────
         terms = phase1.get(
@@ -233,17 +302,36 @@ class CPCClassifier:
         strategy = phase1.get("classification_strategy", "").lower()
 
         # ─────────────────────────────
-        # PHASE 2A: CPC Family Router (PRIMARY CLASSIFIER)
+        # PHASE 2A: CPC Layer Decomposition (REPLACES family routing)
         # ─────────────────────────────
-        # Phase 2A is now the SOLE source of CPC family classification.
-        # Phase 1 only provides semantic understanding - NO CPC predictions.
-        phase2a_result = self.family_router.route(phase1)
-        top_cpc_families = phase2a_result.get("families", [])
-        phase2a_reasoning = phase2a_result.get("reasoning", "")
-        phase2a_source = phase2a_result.get("source", "unknown")
+        # Multi-layer decomposition: each technical layer maps to CPC independently.
+        # NO collapsing into single family. NO cross-layer penalties.
+        # Pass tcr_result to guide layer scoring (FORCE_SOFTWARE_CORE boosts pure_software layer)
+        phase2a_result = self.layer_decomposer.decompose(
+            phase1, phase15_result, tcr_result
+        )
+
+        # Extract layer decomposition results
+        layer_result = phase2a_result
+        layers = layer_result.get("layers", {})
+        primary_layer = layer_result.get("primary_layer", "application")
+        layer_scores = layer_result.get("layer_scores", {})
+        layer_reasoning = layer_result.get("reasoning", "")
+
+        # Get flat family list for backward compatibility with Phase 2B/2C
+        # Pass tcr_result to filter application layer CPCs when TCR indicates pure software
+        top_cpc_families = merge_layers_to_family_list(layer_result, tcr_result)
+        phase2a_reasoning = layer_reasoning
+        phase2a_source = "layer_decomposition"
 
         logger.info(
-            "Phase 2A: Families=%s (source=%s)", top_cpc_families, phase2a_source
+            "Phase 2A: Layer decomposition - primary=%s, layers=%s",
+            primary_layer,
+            list(layers.keys()),
+        )
+        logger.info(
+            "Phase 2A: Layer scores - %s",
+            {k: f"{v:.2f}" for k, v in layer_scores.items()},
         )
 
         # Fallback: if fewer than 2 families, use defaults
@@ -319,46 +407,117 @@ class CPCClassifier:
                 seen.add(cls)
                 combined_classes.append(cls)
 
+        # Extract 4‑character subclass prefixes from Phase 2A TECHNICAL layers only
+        # (excludes application layer). Used for XML expansion and as fallback
+        # combined_classes. Phase 2D will filter precisely later.
+        _tech_layers = {"pure_software", "data_reasoning", "interaction", "control"}
+        _re_4char = re.compile(r"^([A-Z]\d{2}[A-Z])")
+        allowed_roots = []
+        root_seen = set()
+        layers = layer_result.get("layers", {})
+        for layer_name in _tech_layers:
+            for cand in layers.get(layer_name, []):
+                sym = cand.get("symbol", "")
+                m = _re_4char.match(sym)
+                if m:
+                    prefix = m.group(1)
+                    if prefix not in root_seen:
+                        root_seen.add(prefix)
+                        allowed_roots.append(prefix)
+        logger.info(
+            "Phase 2B: Allowed roots (4-char prefixes from tech layers): %s",
+            allowed_roots,
+        )
+
         if not combined_classes:
-            # If no specific classes from KG, use the families themselves for expansion
-            combined_classes = top_cpc_families
+            # Use the technical-layer 4-char prefixes (NOT raw top_cpc_families
+            # which includes application-layer noise like G06Q)
+            combined_classes = allowed_roots
+
+        # Pre-filter: only include classes that actually have XML files on disk.
+        # This prevents wasted parse_file() calls for codes like G05D, G06K
+        # that exist in layer definitions but have no corresponding CPC scheme file.
+        xml_dir = _resolve_xml_dir()
+        available_files = set(os.listdir(xml_dir))
+        valid_combined = []
+        phase2b_skipped = []
+        for cls in combined_classes:
+            xml_name = f"cpc-scheme-{cls}.xml"
+            if xml_name in available_files:
+                valid_combined.append(cls)
+            else:
+                # Try wildcard match (e.g., G05 → G05B, G05D files)
+                pattern = f"cpc-scheme-{cls}"
+                if any(f.startswith(pattern) for f in available_files):
+                    valid_combined.append(cls)
+                else:
+                    phase2b_skipped.append(cls)
+        if phase2b_skipped:
+            logger.warning(
+                "Phase 2B: Skipped %d classes with no XML files: %s",
+                len(phase2b_skipped),
+                phase2b_skipped,
+            )
+        combined_classes = valid_combined
+        allowed_roots = [r for r in allowed_roots if r in valid_combined]
 
         logger.info("Phase 2B: Combined classes (filtered): %s", combined_classes)
+        logger.info(
+            "Phase 2B: Allowed roots (4-char prefixes from tech layers): %s",
+            allowed_roots,
+        )
 
         # ─────────────────────────────
         # PHASE 2C: XML Expansion + Scoring (RESTRICTED)
         # ─────────────────────────────
         candidates = []
+        all_candidates = []
         score_margin = 0.0
         confidence_level = "medium"
         phase2b_candidate_count = 0
         phase2c_final_count = 0
+        # Per-class expansion counts for Phase 2B display
+        phase2b_expansion_counts = {}  # {prefix: subgroup_count}
 
         try:
             # Expand with family prefix filtering
             all_subgroups = self.xml_parser.expand_classes(
                 combined_classes,
                 include_non_allocatable=False,
-                allowed_roots=top_cpc_families,
+                allowed_roots=allowed_roots,
             )
             phase2b_candidate_count = len(all_subgroups)
+
+            # Collect per-class expansion counts
+            for sg in all_subgroups:
+                sym = sg.get("symbol", "")
+                prefix = sym[:4] if len(sym) >= 4 else sym[:3]
+                phase2b_expansion_counts[prefix] = (
+                    phase2b_expansion_counts.get(prefix, 0) + 1
+                )
+
             logger.info(
-                "Phase 2C: Found %d total subgroups (restricted to families %s)",
+                "Phase 2B: Expanded %d total subgroups across %d families: %s",
                 phase2b_candidate_count,
-                top_cpc_families,
+                len(phase2b_expansion_counts),
+                {k: v for k, v in sorted(phase2b_expansion_counts.items())},
             )
 
             if all_subgroups:
                 title_count = len(all_subgroups)
                 doc_freq = Counter()
                 all_tokens = []
+                all_bigrams = []  # NEW: track bigrams per subgroup
 
                 for sg in all_subgroups:
                     context = sg.get("full_context", sg.get("title", "")).lower()
-                    tokens = _tokenize(context)
-                    all_tokens.append(tokens)
-                    for token in tokens:
+                    unigrams, bigrams = _tokenize_with_bigrams(context)
+                    all_tokens.append(unigrams)
+                    all_bigrams.append(bigrams)
+                    for token in unigrams:
                         doc_freq[token] += 1
+                    for bigram in bigrams:
+                        doc_freq[bigram] += 1
 
                 scored = []
                 for idx, sg in enumerate(all_subgroups):
@@ -366,6 +525,9 @@ class CPCClassifier:
                     title = sg.get("title", "").lower()
                     context = sg.get("full_context", title).lower()
                     context_tokens = all_tokens[idx]
+                    context_bigrams = all_bigrams[
+                        idx
+                    ]  # NEW: bigrams for this candidate
                     score = 0.0
                     matching_terms = 0
 
@@ -421,6 +583,16 @@ class CPCClassifier:
                                 idf * importance_weight * 8
                             )  # Higher weight for phrase matches
                             matching_terms += 1
+
+                        # Bigram matching (NEW: captures technical phrases like "system_prompt")
+                        term_bigrams = _make_term_bigrams(term)
+                        if term_bigrams and context_bigrams:
+                            for tb in term_bigrams:
+                                if tb in context_bigrams:
+                                    avg_df = doc_freq.get(tb, 1)
+                                    idf = math.log(title_count / max(avg_df, 1))
+                                    term_score += idf * (importance / 5.0) * 6
+                                    matching_terms += 1
 
                         # Word overlap
                         overlap = term_tokens & context_tokens
@@ -605,7 +777,40 @@ class CPCClassifier:
 
                 scored.sort(key=lambda x: -x[0])
 
-                # Normalization
+                # ═══════════════════════════════════════════════
+                # HYBRID SCORING: TF-IDF + Semantic Similarity
+                # Formula: Final = 0.4 × TF-IDF_norm + 0.6 × Sem_Sim
+                # ═══════════════════════════════════════════════
+                sem_scores = {}
+                if self.knowledge_graph and self.knowledge_graph.embeddings:
+                    patent_text = (
+                        phase1.get("technical_object", "")
+                        + " "
+                        + phase1.get("core_function", "")
+                    )
+                    sem_scores = self._compute_semantic_scores(
+                        [sg for _, sg, _ in scored], patent_text
+                    )
+
+                if sem_scores:
+                    # Replace tuple scores with actual hybrid scores for proper normalization
+                    max_tfidf = max(s[0] for s in scored) if scored else 1.0
+                    hybrid_scored = []
+                    for tfidf_score, sg, matching_terms in scored:
+                        sym = sg.get("symbol", "")
+                        tfidf_norm = tfidf_score / max_tfidf if max_tfidf > 0 else 0.0
+                        sem = sem_scores.get(sym, 0.0)
+                        hybrid = 0.4 * tfidf_norm + 0.6 * sem
+                        hybrid_scored.append((round(hybrid, 6), sg, matching_terms))
+                    scored = hybrid_scored
+                    scored.sort(key=lambda x: -x[0])
+                    logger.info(
+                        "Hybrid scoring applied (0.4×TF-IDF + 0.6×Semantic) for %d candidates",
+                        len(scored),
+                    )
+
+                # Normalization (common to both TF-IDF-only and hybrid)
+                all_candidates = []
                 if scored:
                     scores = [s[0] for s in scored]
                     max_score = max(scores)
@@ -618,7 +823,7 @@ class CPCClassifier:
 
                     # Calculate margin (W6)
                     if len(scores) >= 2:
-                        score_margin = (scores[0] - scores[1]) / denom
+                        score_margin = round((scores[0] - scores[1]) / denom, 6)
                         if score_margin > 0.3:
                             confidence_level = "high"
                         elif score_margin < 0.1:
@@ -626,22 +831,25 @@ class CPCClassifier:
                         else:
                             confidence_level = "medium"
 
-                    for score, sg, _ in scored[:10]:
+                    # Normalize ALL scored candidates (no truncation yet —
+                    # Find-Until-Full below will determine the depth)
+                    all_candidates = []
+                    for score, sg, _ in scored:
                         normalized_score = min(score / denom, 1.0)
-                        candidates.append(
+                        all_candidates.append(
                             {
                                 "symbol": sg["symbol"],
                                 "title": sg["title"],
                                 "level": sg.get("level", 0),
-                                "score": round(normalized_score, 4),
+                                "score": round(normalized_score, 6),
                                 "full_context": sg.get("full_context", sg["title"]),
                             }
                         )
 
-                    phase2c_final_count = len(candidates)
+                    phase2c_final_count = len(all_candidates)
 
                 logger.info(
-                    "Phase 2C: Selected %d final candidates, margin=%.4f, confidence=%s",
+                    "Phase 2C: Scored %d total candidates, margin=%.6f, confidence=%s",
                     phase2c_final_count,
                     score_margin,
                     confidence_level,
@@ -650,9 +858,76 @@ class CPCClassifier:
             logger.error("Phase 2 expansion failed: %s", e)
 
         # ─────────────────────────────
-        # PHASE 3: Ranking
+        # PHASE 2D: Subclass Structural Anchor + Find-Until-Full
         # ─────────────────────────────
-        ranked = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:10]
+        # Progressive expansion: start with top 500, deep-search to 1000,
+        # then exhaust all candidates if still under the 20-survivor quota.
+        phase2d_result = {}
+        find_until_full_log = []  # [{depth, survivors, triggered_deep}, ...]
+        candidates = []
+        try:
+            anchor_filter = Phase2DSubclassAnchor()
+            search_depths = [500, 1000, len(all_candidates) if all_candidates else 0]
+            search_depths = [d for d in search_depths if d > 0]
+
+            for depth in search_depths:
+                batch = all_candidates[:depth]
+                phase2d_result = anchor_filter.filter(
+                    candidates=batch,
+                    layer_result=layer_result,
+                    max_result=depth,
+                )
+                survivors = phase2d_result.get("purified_candidates", [])
+                kept = len(survivors)
+
+                entry = {
+                    "depth": depth,
+                    "survivors_found": kept,
+                    "deep_search_triggered": kept < 20,
+                }
+                find_until_full_log.append(entry)
+
+                if kept >= 20 or depth == search_depths[-1]:
+                    if depth == 500 and kept >= 20:
+                        logger.info(
+                            "Find-Until-Full: Scanned %d to find %d valid technical anchors. ✓ Quota met.",
+                            depth,
+                            kept,
+                        )
+                    elif kept >= 20:
+                        logger.info(
+                            "Deep Search required. Scanned %d to find %d valid technical anchors. ✓ Quota met.",
+                            depth,
+                            kept,
+                        )
+                    else:
+                        logger.warning(
+                            "Find-Until-Full exhausted: Scanned %d to find only %d valid technical anchors. Using all survivors.",
+                            depth,
+                            kept,
+                        )
+                    candidates = survivors
+                    break
+                else:
+                    logger.info(
+                        "Deep Search required. Scanned %d to find %d valid technical anchors. Expanding to next depth.",
+                        depth,
+                        kept,
+                    )
+
+            logger.info(
+                "Phase 2D: Final — kept=%d discarded=%d anchor_subclasses=%s",
+                phase2d_result.get("kept_count", 0),
+                phase2d_result.get("discarded_count", 0),
+                ", ".join(phase2d_result.get("anchor_set", [])),
+            )
+        except Exception as e:
+            logger.warning("Phase 2D anchor filter failed: %s", e)
+
+        # ─────────────────────────────
+        # PHASE 3: Ranking (Top 20 for Phase 8 completeness)
+        # ─────────────────────────────
+        ranked = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:20]
 
         # ─────────────────────────────
         # PHASE 3.5: Decision Tree Constraint Layer
@@ -660,36 +935,39 @@ class CPCClassifier:
         phase35_result = {}
         try:
             dt_constraint = CPCDecisionTreeConstraint()
-            phase35_result = dt_constraint.apply_constraints(ranked, phase1)
+            phase35_result = dt_constraint.apply_constraints(
+                ranked, phase1, layer_result, tcr_result
+            )
             ranked = phase35_result.get("phase35_candidates", ranked)
             logger.info(
-                "Phase 3.5: Applied %d constraint rules. Domain=%s (conf=%.2f).",
+                "Phase 3.5: Applied %d constraint rules. Domain=%s (conf=%.2f). Layer-mode=%s",
                 phase35_result.get("phase35_adjustments", 0),
                 phase35_result.get("phase35_domain", "unknown"),
                 phase35_result.get("phase35_domain_confidence", 0),
+                phase35_result.get("phase35_layer_mode", False),
             )
         except Exception as e:
             logger.warning("Phase 3.5 decision tree failed: %s", e)
 
         # ─────────────────────────────
-        # PHASE 3.6: Universal CPC Hierarchy Selection Layer
+        # PHASE 3.6: Cross-Domain Validation Layer
         # ─────────────────────────────
         phase36_result = {}
         try:
-            hierarchy_engine = UniversalCPCHierarchyEngine()
-            phase36_result = hierarchy_engine.apply_hierarchy(
+            validator = CrossDomainValidator()
+            phase36_result = validator.validate(
                 ranked,
                 phase1,
-                primary_domain=phase35_result.get("phase35_domain"),
+                phase35_result,
             )
             ranked = phase36_result.get("phase36_candidates", ranked)
             logger.info(
-                "Phase 3.6: Contribution type=%s, adjustments=%d",
-                phase36_result.get("phase36_primary_type", "unknown"),
+                "Phase 3.6: Cross-domain validation complete. Verified=%s, adjustments=%d",
+                phase36_result.get("phase36_domain_verified", False),
                 phase36_result.get("phase36_adjustments", 0),
             )
         except Exception as e:
-            logger.warning("Phase 3.6 hierarchy engine failed: %s", e)
+            logger.warning("Phase 3.6 cross-domain validation failed: %s", e)
 
         # ─────────────────────────────
         # PHASE 4: CPC Hypothesis Consolidation
@@ -721,7 +999,7 @@ class CPCClassifier:
 
         try:
             resolver = CPCHypothesisResolver()
-            phase5_result = resolver.resolve(phase4_result, phase1)
+            phase5_result = resolver.resolve(phase4_result, phase1, all_candidates)
 
             # Build validated_candidates from Phase 5 for backward compat
             primary = phase5_result.get("primary", {})
@@ -777,31 +1055,10 @@ class CPCClassifier:
                     "reasoning": "Resolution skipped due to error",
                 }
 
-        # ─────────────────────────────
-        # PHASE 6: Per-claim reconciliation (W7)
-        # ─────────────────────────────
-        reconciled_claims = []
-        try:
-            per_claim = phase1.get("claim_classifications", [])
-            if per_claim and (validated_candidates or filtered_out):
-                recon_prompt = reconciliation_prompt(
-                    validated_candidates, filtered_out, per_claim
-                )
-                recon_response = self.llm.chat(
-                    system_prompt="You are reconciling claim-level CPC classifications.",
-                    user_message=recon_prompt,
-                    temperature=0.1,
-                    max_tokens=2000,
-                )
-                recon_data = _parse_llm_json(recon_response)
-                reconciled_claims = recon_data.get("reconciled_claims", [])
-                logger.info("Phase 6: Reconciled %d claims", len(reconciled_claims))
-        except Exception as e:
-            logger.warning("Phase 6 reconciliation failed: %s", e)
-
-        # ─────────────────────────────
-        # PHASE 7: Final consistency check
-        # ─────────────────────────────
+        # ─────────────────────────────────────────────────────────────
+        # FINAL CONSISTENCY CHECK + Feedback Loop
+        # (Integrated into Phase 5/8 — not shown as separate step)
+        # ─────────────────────────────────────────────────────────────
         consistency_result = {}
         try:
             if validated_candidates:
@@ -828,11 +1085,176 @@ class CPCClassifier:
                     "reasoning": consist_data.get("reasoning", ""),
                 }
                 logger.info(
-                    "Phase 7: Consistency check: coherent=%s",
+                    "Final Consistency: coherent=%s",
                     consistency_result.get("coherent", True),
                 )
         except Exception as e:
-            logger.warning("Phase 7 consistency check failed: %s", e)
+            logger.warning("Final consistency check failed: %s", e)
+
+        # ─────────────────────────────────────────────────────────────
+        # FEEDBACK LOOP: If consistency detects issues, constrain scoring
+        # ─────────────────────────────────────────────────────────────
+        # If Phase 7 detects issues, use recommendations to constrain re-scoring
+        # This gives the system a "second chance" to fix semantic drift
+        feedback_applied = False
+        feedback_constrained_families = []
+
+        try:
+            issues = consistency_result.get("issues", [])
+            recommended_primary = consistency_result.get("recommended_primary", "")
+            recommended_secondary = consistency_result.get("recommended_secondary", [])
+
+            # Check if consistency detected problems
+            has_warnings = (
+                not consistency_result.get("coherent", True)
+                or len(issues) > 0
+                or recommended_primary  # LLM recommended a different primary
+            )
+
+            if has_warnings and recommended_primary:
+                logger.info(
+                    "Feedback loop triggered. Issues=%d, Recommended Primary=%s",
+                    len(issues),
+                    recommended_primary,
+                )
+
+                # Build constrained family set from consistency recommendations
+                feedback_constrained_families = [
+                    recommended_primary[:4]
+                ]  # 4-char prefix
+                for sec in recommended_secondary:
+                    if sec and len(sec) >= 4:
+                        feedback_constrained_families.append(sec[:4])
+
+                # Also include any families mentioned in issues
+                for issue in issues:
+                    issue_str = str(issue).upper()
+                    family_patterns = re.findall(r"[A-Z]\d{2}[A-Z]?", issue_str)
+                    for fp in family_patterns:
+                        if fp not in feedback_constrained_families:
+                            feedback_constrained_families.append(fp)
+
+                logger.info(
+                    "Feedback loop: Constrained families: %s",
+                    feedback_constrained_families,
+                )
+
+                # Filter validated_candidates to only include constrained families
+                if validated_candidates:
+                    original_count = len(validated_candidates)
+                    validated_candidates = [
+                        c
+                        for c in validated_candidates
+                        if any(
+                            c.get("symbol", "").startswith(f)
+                            for f in feedback_constrained_families
+                        )
+                    ]
+                    filtered_count = len(validated_candidates)
+
+                    if filtered_count < original_count:
+                        logger.info(
+                            "Feedback loop: Filtered candidates %d -> %d",
+                            original_count,
+                            filtered_count,
+                        )
+
+                    # If no candidates remain after filtering, keep top candidates
+                    if not validated_candidates:
+                        validated_candidates = [
+                            c
+                            for c in ranked[:5]
+                            if not any(
+                                c.get("symbol", "").startswith(h)
+                                for h in ["H02", "B60Q"]
+                            )
+                        ]
+                        logger.warning(
+                            "Feedback loop: No candidates matched feedback filter. "
+                            "Using top ranked (excluding hardware)"
+                        )
+
+                    feedback_applied = True
+
+        except Exception as e:
+            logger.warning("Phase 7.5 feedback loop failed: %s", e)
+
+        # ─────────────────────────────
+        # PHASE 8: CPC Role Labeling (3-Layer Explanation Model)
+        # ─────────────────────────────
+        role_labeling_result = {}
+        try:
+            # Build enhanced candidates list including Phase 7 recommendations
+            enhanced_candidates = list(ranked)  # Start with ranked candidates
+
+            # Add Phase 7 recommended codes if they exist and aren't already present
+            recommended_primary = consistency_result.get("recommended_primary", "")
+            recommended_secondary = consistency_result.get("recommended_secondary", [])
+
+            # Add primary recommendation
+            if recommended_primary:
+                if isinstance(recommended_primary, dict):
+                    sym = recommended_primary.get("symbol", "")
+                else:
+                    sym = recommended_primary
+
+                if sym and not any(
+                    c.get("symbol", "").startswith(sym[:6])
+                    for c in enhanced_candidates[:10]
+                ):
+                    enhanced_candidates.insert(
+                        0,
+                        {
+                            "symbol": sym,
+                            "title": f"Recommended by Phase 7: {recommended_primary.get('title', 'Primary recommendation')}"
+                            if isinstance(recommended_primary, dict)
+                            else sym,
+                            "score": 1.0,
+                            "contribution_match": "primary",
+                        },
+                    )
+                    logger.info("Phase 8: Added Phase 7 recommended primary: %s", sym)
+
+            # Add secondary recommendations
+            for sec in recommended_secondary:
+                if isinstance(sec, dict):
+                    sym = sec.get("symbol", "")
+                    title = sec.get("title", sym)
+                else:
+                    sym = sec
+                    title = sec
+
+                if sym and not any(
+                    c.get("symbol", "").startswith(sym[:6])
+                    for c in enhanced_candidates[:10]
+                ):
+                    enhanced_candidates.insert(
+                        1,
+                        {
+                            "symbol": sym,
+                            "title": f"Recommended by Phase 7: {title}",
+                            "score": 0.95,
+                            "contribution_match": "secondary",
+                        },
+                    )
+                    logger.info("Phase 8: Added Phase 7 recommended secondary: %s", sym)
+
+            labeler = CPCRoleLabeling(llm=self.llm)
+            role_labeling_result = labeler.label_roles(
+                candidates=enhanced_candidates,
+                phase1_data=phase1,
+                phase36_result=phase36_result,
+                tcr_result=tcr_result,
+            )
+            logger.info(
+                "Phase 8: Role labeling complete. Core=%d, Support=%d, Context=%d, Coverage=%d",
+                len(role_labeling_result.get("layer1_core", [])),
+                len(role_labeling_result.get("layer2_support", [])),
+                len(role_labeling_result.get("layer2_context", [])),
+                len(role_labeling_result.get("layer3_coverage", [])),
+            )
+        except Exception as e:
+            logger.warning("Phase 8 role labeling failed: %s", e)
 
         # ─────────────────────────────
         # Build final result
@@ -849,92 +1271,88 @@ class CPCClassifier:
         phase2 = {
             "codes": [node["symbol"] for node in ranked],
             "reasoning": (
-                "Ranked by improved TF-IDF scoring with section-aware term weighting, "
-                "word-level matching, parent context, expanded synonyms, and probabilistic "
-                "domain boosting. Score margin and confidence level calculated. "
-                "Claims terms weighted 2x. "
-                f"Phase 2A routed to families {top_cpc_families} via {phase2a_source}. "
-                f"Primary={phase2a_result.get('primary', 'N/A')}, "
-                f"modality={phase2a_result.get('modality', 'unknown')}. "
+                "Multi-layer CPC decomposition: each technical layer maps to CPC independently. "
+                "No cross-layer penalties. No forced hierarchy. "
+                f"Primary layer={primary_layer}. "
+                f"Layer scores={ {k: round(v, 2) for k, v in layer_scores.items()} }. "
                 f"Phase 2B expanded to {phase2b_candidate_count} candidates, "
                 f"Phase 2C scored down to {phase2c_final_count}."
             ),
-            "score_margin": round(score_margin, 4),
+            "score_margin": round(score_margin, 6),
             "confidence_level": confidence_level,
-            "phase2a_families": top_cpc_families,
-            "phase2a_primary": phase2a_result.get("primary", ""),
-            "phase2a_secondary": phase2a_result.get("secondary", []),
-            "phase2a_modality": phase2a_result.get("modality", "unknown"),
-            "phase2a_reasoning": phase2a_reasoning,
             "phase2a_source": phase2a_source,
+            "phase2a_reasoning": phase2a_reasoning,
+            "phase2a_families": top_cpc_families,
+            "phase2a_primary_layer": primary_layer,
+            "phase2a_layer_scores": {k: round(v, 4) for k, v in layer_scores.items()},
             "phase2b_candidate_count": phase2b_candidate_count,
+            "phase2b_expansion_counts": phase2b_expansion_counts,
+            "phase2b_skipped_classes": phase2b_skipped,
             "phase2c_final_count": phase2c_final_count,
+            "phase2d_anchor_set": phase2d_result.get("anchor_set", []),
+            "phase2d_anchor_source": phase2d_result.get("anchor_source", []),
+            "phase2d_kept_count": phase2d_result.get("kept_count", 0),
+            "phase2d_discarded_count": phase2d_result.get("discarded_count", 0),
+            "phase2d_discard_log": phase2d_result.get("discard_log", []),
+            "phase2d_find_until_full": find_until_full_log,
+            "phase2c_total_scored": phase2c_final_count,
         }
 
-        result = {
-            "phase1": phase1,
-            "phase2": phase2,
-            "phase3": ranked,
-            "phase35": phase35_result,
-            "phase36": phase36_result,
-            "phase4": phase4_result,
-            "cpc": cpc,
-        }
-
-        # Store Phase 5 result (new deterministic resolver)
-        if phase5_result:
-            result["phase5"] = phase5_result
-        elif validated_candidates or filtered_out:
-            # Fallback to old format
-            result["phase5"] = {
-                "validated_candidates": validated_candidates,
-                "filtered_out": filtered_out,
-                "best_code": best_code,
-            }
-
-        # ── Premier: use Phase 7 recommendation if available ──
-        premier_symbol = None
+        # ── Premier: determine main recommendation BEFORE building result ──
+        premier_data = None
         if consistency_result.get("coherent") and consistency_result.get(
             "recommended_primary"
         ):
             premier_symbol = consistency_result["recommended_primary"]
-            # Try to find title from validated candidates or ranked
             premier_title = ""
             for node in validated_candidates or ranked:
                 if node.get("symbol") == premier_symbol:
                     premier_title = node.get("title", "")
                     break
-            result["premier"] = {
+            premier_data = {
                 "symbol": premier_symbol,
                 "title": premier_title,
                 "confidence": "high",
-                "reasoning": f"Phase 7 consistency check selected this as the recommended primary code. {consistency_result.get('reasoning', '')}",
+                "reasoning": f"Final consistency check selected this as the recommended primary code. {consistency_result.get('reasoning', '')}",
             }
         elif best_code and best_code.get("symbol"):
-            result["premier"] = {
+            premier_data = {
                 "symbol": best_code.get("symbol"),
                 "title": best_code.get("title", ""),
                 "confidence": best_code.get("confidence", "medium"),
                 "reasoning": best_code.get("reasoning", ""),
             }
         elif ranked:
-            result["premier"] = {
+            premier_data = {
                 "symbol": ranked[0]["symbol"],
                 "title": ranked[0]["title"],
                 "confidence": "medium",
                 "reasoning": "Top-scoring candidate from Phase 2/3 scoring",
             }
 
-        if reconciled_claims:
-            result["per_claim"] = reconciled_claims
-        else:
-            # Fallback to original per-claim if reconciliation failed
-            claim_classifications = phase1.get("claim_classifications", [])
-            if claim_classifications:
-                result["per_claim"] = claim_classifications
-
-        if consistency_result:
-            result["phase7"] = consistency_result
+        result = {
+            "phase1": phase1,
+            "phase15": phase15_result,
+            "tcr_analysis": tcr_result,
+            "phase2": phase2,
+            "phase2a_layers": layer_result,
+            "phase3": ranked,
+            "phase35": phase35_result,
+            "phase36": phase36_result,
+            "phase8_role_labeling": role_labeling_result,
+            "phase4": phase4_result,
+            "cpc": cpc,
+            "formatted_report": self._build_formatted_report(
+                phase1,
+                role_labeling_result,
+                consistency_result,
+                tcr_result,
+                pillars=phase5_result.get("pillars", {}),
+                premier=premier_data,
+            ),
+        }
+        if premier_data:
+            result["premier"] = premier_data
 
         return result
 
@@ -1010,10 +1428,12 @@ class CPCClassifier:
         combined_classes = top_cpc_families
 
         candidates = []
+        all_candidates = []
         score_margin = 0.0
         confidence_level = "medium"
         phase2b_candidate_count = 0
         phase2c_final_count = 0
+        phase2b_expansion_counts = {}
 
         try:
             all_subgroups = self.xml_parser.expand_classes(
@@ -1022,6 +1442,14 @@ class CPCClassifier:
                 allowed_roots=top_cpc_families,
             )
             phase2b_candidate_count = len(all_subgroups)
+
+            # Per-class expansion counts
+            for sg in all_subgroups:
+                sym = sg.get("symbol", "")
+                prefix = sym[:4] if len(sym) >= 4 else sym[:3]
+                phase2b_expansion_counts[prefix] = (
+                    phase2b_expansion_counts.get(prefix, 0) + 1
+                )
 
             if all_subgroups:
                 # Score candidates
@@ -1036,27 +1464,114 @@ class CPCClassifier:
                 )
 
                 if scored:
+                    # ═══════════════════════════════════════════════
+                    # HYBRID SCORING: TF-IDF + Semantic Similarity
+                    # ═══════════════════════════════════════════════
+                    sem_scores = {}
+                    if self.knowledge_graph and self.knowledge_graph.embeddings:
+                        patent_text = (
+                            phase1.get("technical_object", "")
+                            + " "
+                            + phase1.get("core_function", "")
+                        )
+                        sem_scores = self._compute_semantic_scores(
+                            [sg for _, sg, _ in scored], patent_text
+                        )
+
+                    if sem_scores:
+                        max_tfidf = max(s[0] for s in scored) if scored else 1.0
+                        hybrid_scored = []
+                        for tfidf_score, sg, matching_terms in scored:
+                            sym = sg.get("symbol", "")
+                            tfidf_norm = (
+                                tfidf_score / max_tfidf if max_tfidf > 0 else 0.0
+                            )
+                            sem = sem_scores.get(sym, 0.0)
+                            hybrid = 0.4 * tfidf_norm + 0.6 * sem
+                            hybrid_scored.append((round(hybrid, 6), sg, matching_terms))
+                        scored = hybrid_scored
+                        scored.sort(key=lambda x: -x[0])
+
                     denom = scored[0][0]
                     if denom == 0:
                         denom = 1.0
 
-                    for score, sg, _ in scored[:10]:
+                    # Normalize ALL scored candidates (Find-Until-Full below)
+                    all_candidates = []
+                    for score, sg, _ in scored:
                         normalized_score = min(score / denom, 1.0)
-                        candidates.append(
+                        all_candidates.append(
                             {
                                 "symbol": sg["symbol"],
                                 "title": sg["title"],
                                 "level": sg.get("level", 0),
-                                "score": round(normalized_score, 4),
+                                "score": round(normalized_score, 6),
                                 "full_context": sg.get("full_context", sg["title"]),
                             }
                         )
 
-                    phase2c_final_count = len(candidates)
+                    phase2c_final_count = len(all_candidates)
         except Exception as e:
             logger.error("Phase 2B/C error: %s", e)
 
-        ranked = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:10]
+        # ─────────────────────────────
+        # PHASE 2D: Subclass Structural Anchor + Find-Until-Full
+        # ─────────────────────────────
+        phase2d_result = {}
+        find_until_full_log = []
+        try:
+            anchor_filter = Phase2DSubclassAnchor()
+            search_depths = [500, 1000, len(all_candidates) if all_candidates else 0]
+            search_depths = [d for d in search_depths if d > 0]
+
+            for depth in search_depths:
+                batch = all_candidates[:depth]
+                phase2d_result = anchor_filter.filter(
+                    candidates=batch,
+                    layer_result=phase2a_result,
+                    max_result=depth,
+                )
+                survivors = phase2d_result.get("purified_candidates", [])
+                kept = len(survivors)
+
+                entry = {
+                    "depth": depth,
+                    "survivors_found": kept,
+                    "deep_search_triggered": kept < 20,
+                }
+                find_until_full_log.append(entry)
+
+                if kept >= 20 or depth == search_depths[-1]:
+                    if depth == 500 and kept >= 20:
+                        logger.info(
+                            "Find-Until-Full: Scanned %d to find %d valid technical anchors. ✓ Quota met.",
+                            depth,
+                            kept,
+                        )
+                    elif kept >= 20:
+                        logger.info(
+                            "Deep Search required. Scanned %d to find %d valid technical anchors. ✓ Quota met.",
+                            depth,
+                            kept,
+                        )
+                    else:
+                        logger.warning(
+                            "Find-Until-Full exhausted: Scanned %d to find only %d valid technical anchors. Using all survivors.",
+                            depth,
+                            kept,
+                        )
+                    candidates = survivors
+                    break
+                else:
+                    logger.info(
+                        "Deep Search required. Scanned %d to find %d valid technical anchors. Expanding to next depth.",
+                        depth,
+                        kept,
+                    )
+        except Exception as e:
+            logger.warning("Phase 2D anchor filter failed: %s", e)
+
+        ranked = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:20]
 
         # ─────────────────────────────
         # PHASE 4: Consolidation
@@ -1077,7 +1592,7 @@ class CPCClassifier:
         phase5_result = {}
         try:
             resolver = CPCHypothesisResolver()
-            phase5_result = resolver.resolve(phase4_result, phase1)
+            phase5_result = resolver.resolve(phase4_result, phase1, all_candidates)
         except Exception as e:
             logger.warning("Phase 5 error: %s", e)
 
@@ -1100,13 +1615,73 @@ class CPCClassifier:
                 "phase2a_reasoning": phase2a_reasoning,
                 "phase2a_source": phase2a_source,
                 "phase2b_candidate_count": phase2b_candidate_count,
+                "phase2b_expansion_counts": phase2b_expansion_counts,
                 "phase2c_final_count": phase2c_final_count,
+                "phase2c_total_scored": phase2c_final_count,
+                "phase2d_anchor_set": phase2d_result.get("anchor_set", []),
+                "phase2d_kept_count": phase2d_result.get("kept_count", 0),
+                "phase2d_discarded_count": phase2d_result.get("discarded_count", 0),
+                "phase2d_find_until_full": find_until_full_log,
             },
             "phase3": ranked,
             "phase4": phase4_result,
             "phase5": phase5_result,
             "cpc": cpc,
         }
+
+    def _compute_semantic_scores(
+        self, candidates: List[Dict], patent_text: str
+    ) -> Dict[str, float]:
+        """
+        Compute semantic similarity scores for candidate CPCs using the KG embeddings.
+
+        Uses all-mpnet-base-v2 embedding model to compute cosine similarity
+        between the patent's technical text and each candidate CPC title.
+        Returns dict mapping candidate symbol -> normalized similarity [0, 1].
+        Falls back to empty dict if KG is unavailable.
+        """
+        sem_scores: Dict[str, float] = {}
+        if not self.knowledge_graph or not self.knowledge_graph.embeddings:
+            return sem_scores
+
+        try:
+            model = self.knowledge_graph._get_model()
+            query_emb = model.encode(
+                [patent_text], show_progress_bar=False, convert_to_numpy=True
+            )[0]
+            query_norm = np.linalg.norm(query_emb)
+
+            if query_norm == 0:
+                return sem_scores
+
+            for c in candidates:
+                symbol = c.get("symbol", "")
+                if symbol not in self.knowledge_graph.embeddings:
+                    continue
+                cand_emb = self.knowledge_graph.embeddings[symbol]
+                cand_norm = np.linalg.norm(cand_emb)
+                if cand_norm == 0:
+                    continue
+                sim = float(np.dot(query_emb, cand_emb) / (query_norm * cand_norm))
+                sem_scores[symbol] = max(0.0, sim)
+
+            # Normalize to [0, 1] scale
+            if sem_scores:
+                max_val = max(sem_scores.values())
+                if max_val > 0:
+                    for sym in sem_scores:
+                        sem_scores[sym] /= max_val
+
+            logger.info(
+                "Semantic scores computed for %d/%d candidates (KG=%s)",
+                len(sem_scores),
+                len(candidates),
+                "loaded" if self.knowledge_graph else "unavailable",
+            )
+        except Exception as e:
+            logger.warning("Semantic scoring failed, falling back to TF-IDF: %s", e)
+
+        return sem_scores
 
     def _score_candidates(
         self,
@@ -1118,29 +1693,34 @@ class CPCClassifier:
         phase2a_result,
         negative_signals,
     ):
-        """Score candidates using TF-IDF."""
+        """Score candidates using TF-IDF with bigram support + hybrid semantic blending."""
         import math
         from collections import Counter
 
         scored = []
 
-        # Build document frequency
+        # Build document frequency (unigrams + bigrams)
         doc_freq = Counter()
         title_count = len(all_subgroups)
+        all_context_bigrams = []
 
         for sg in all_subgroups:
             context = sg.get("full_context", sg["title"]).lower()
-            tokens = set(context.split())
-            for token in tokens:
-                if len(token) > 2:
-                    doc_freq[token] += 1
+            unigrams, bigrams = _tokenize_with_bigrams(context)
+            all_context_bigrams.append(bigrams)
+            for token in unigrams:
+                doc_freq[token] += 1
+            for bigram in bigrams:
+                doc_freq[bigram] += 1
 
         # Score each subgroup
-        for sg in all_subgroups:
+        for idx, sg in enumerate(all_subgroups):
             score = 0.0
             matching_terms = 0
             context = sg.get("full_context", sg["title"]).lower()
-            context_tokens = set(context.split())
+            context_tokens = set(re.findall(r"[a-zA-Z]+", context))
+            context_tokens = {_normalize_word(w) for w in context_tokens if len(w) > 2}
+            context_bigrams = all_context_bigrams[idx]
             title_lower = sg["title"].lower()
             symbol = sg["symbol"]
 
@@ -1156,7 +1736,9 @@ class CPCClassifier:
             for term, importance in term_importance.items():
                 term_score = 0.0
                 importance_weight = importance / 10.0
-                term_tokens = set(term.split())
+                term_tokens = {
+                    _normalize_word(t) for t in term.lower().split() if len(t) > 2
+                }
 
                 # Multi-word phrase match
                 if len(term.split()) >= 2 and term in context:
@@ -1166,6 +1748,16 @@ class CPCClassifier:
                     idf = math.log(title_count / max(avg_df, 1))
                     term_score += idf * importance_weight * 8
                     matching_terms += 1
+
+                # Bigram matching (NEW: captures technical phrases)
+                term_bigrams = _make_term_bigrams(term)
+                if term_bigrams and context_bigrams:
+                    for tb in term_bigrams:
+                        if tb in context_bigrams:
+                            avg_df = doc_freq.get(tb, 1)
+                            idf = math.log(title_count / max(avg_df, 1))
+                            term_score += idf * (importance / 5.0) * 6
+                            matching_terms += 1
 
                 # Word overlap
                 overlap = term_tokens & context_tokens
@@ -1221,3 +1813,179 @@ class CPCClassifier:
 
         scored.sort(key=lambda x: -x[0])
         return scored
+
+    def _build_formatted_report(
+        self,
+        phase1: Dict[str, Any],
+        role_labeling_result: Dict[str, Any],
+        consistency_result: Dict[str, Any],
+        tcr_result: Optional[Dict[str, Any]] = None,
+        pillars: Optional[Dict[str, Any]] = None,
+        premier: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Build an Executive Patent Classification Report in Markdown.
+
+        Format:
+        # Executive Patent Classification Report
+        ## Main Recommendation (Premier Code + Confidence)
+        ## Technical Breakdown (Facets table)
+        ## Professional Justification
+        ## Suggested Indexing Codes
+        ## Supporting Details (Core / Support / Context / Coverage)
+        """
+        lines = []
+        coherent = consistency_result.get("coherent", True)
+        premier_symbol = premier.get("symbol", "") if premier else ""
+        premier_title = premier.get("title", "") if premier else ""
+
+        # ═══════════════════════════════════════════════════════════
+        # HEADER & HERO
+        # ═══════════════════════════════════════════════════════════
+        lines.append("# 📄 Executive Patent Classification Report")
+        lines.append("")
+        if premier_symbol:
+            status = (
+                "✅ Validated via Cross-Domain Consistency Check"
+                if coherent
+                else "⚠️ Requires Review"
+            )
+            lines.append(
+                f"## Main Recommendation: `{premier_symbol}` — {premier_title}"
+            )
+            lines.append("")
+            lines.append(f"**Status:** {status}")
+        else:
+            lines.append("## Main Recommendation: Not Available")
+        lines.append("")
+
+        # ═══════════════════════════════════════════════════════════
+        # TECH STACK TABLE
+        # ═══════════════════════════════════════════════════════════
+        goal = {}
+        method = {}
+        context = {}
+        if pillars:
+            lines.append("## 🛠 Technical Breakdown")
+            lines.append("")
+            lines.append("| Role | CPC Code | Description |")
+            lines.append("|------|----------|-------------|")
+            goal = pillars.get("pillar1_goal", {})
+            method = pillars.get("pillar2_method", {})
+            context = pillars.get("pillar3_context", {})
+            if goal and goal.get("symbol"):
+                lines.append(
+                    f"| **Primary Goal** | `{goal['symbol']}` | {self._shorten(goal.get('title', ''), 80)} |"
+                )
+            if method and method.get("symbol"):
+                lines.append(
+                    f"| **AI Methodology** | `{method['symbol']}` | {self._shorten(method.get('title', ''), 80)} |"
+                )
+            if context and context.get("symbol"):
+                lines.append(
+                    f"| **Domain Context** | `{context['symbol']}` | {self._shorten(context.get('title', ''), 80)} |"
+                )
+            lines.append("")
+
+        # ═══════════════════════════════════════════════════════════
+        # PROFESSIONAL JUSTIFICATION
+        # ═══════════════════════════════════════════════════════════
+        lines.append("## 💡 Professional Justification")
+        lines.append("")
+        llm_summary = role_labeling_result.get("phase85_executive_summary", "")
+        if llm_summary:
+            lines.append(llm_summary)
+        else:
+            # Fallback justification from facets
+            parts = []
+            if premier_symbol:
+                parts.append(
+                    f"The invention is primarily classified in `{premier_symbol}` as it represents the core technical contribution."
+                )
+            if method and method.get("symbol"):
+                parts.append(
+                    f"The use of `{method['symbol']}` reflects the AI/ML implementation strategy."
+                )
+            if context and context.get("symbol"):
+                parts.append(
+                    f"The inclusion of `{context['symbol']}` ensures the patent is protected within its specific industrial application domain."
+                )
+            if parts:
+                lines.append(" ".join(parts))
+            else:
+                lines.append(
+                    "The classification reflects the primary technical contribution of the disclosed invention "
+                    "based on semantic analysis of the patent text, technical weight analysis, and cross-domain validation."
+                )
+        lines.append("")
+
+        # ═══════════════════════════════════════════════════════════
+        # SUGGESTED INDEXING CODES
+        # ═══════════════════════════════════════════════════════════
+        core = role_labeling_result.get("layer1_core", [])
+        support = role_labeling_result.get("layer2_support", [])
+        context_codes = role_labeling_result.get("layer2_context", [])
+        coverage = role_labeling_result.get("layer3_coverage", [])
+
+        all_listed = set()
+        for c in [core, support, context_codes, coverage]:
+            for item in c:
+                all_listed.add(item.get("symbol", ""))
+
+        # Collect pillars symbols already shown
+        pillar_symbols = set()
+        if pillars:
+            for k, v in pillars.items():
+                if v.get("symbol"):
+                    pillar_symbols.add(v["symbol"])
+
+        suggested = []
+        for c in [core, support, context_codes, coverage]:
+            for item in c:
+                sym = item.get("symbol", "")
+                if sym not in pillar_symbols and sym != premier_symbol:
+                    title = item.get("title", "")
+                    if title:
+                        suggested.append(f"`{sym}` — {self._shorten(title, 80)}")
+
+        if suggested:
+            lines.append("## 📋 Suggested Indexing Codes")
+            lines.append("")
+            for s in suggested[:10]:
+                lines.append(f"- {s}")
+            lines.append("")
+            lines.append(
+                "_Copy these codes into your patent application as supplementary indexing references._"
+            )
+        lines.append("")
+
+        # ═══════════════════════════════════════════════════════════
+        # SUPPORTING DETAILS (condensed)
+        # ═══════════════════════════════════════════════════════════
+        if core or support or context_codes:
+            lines.append("## 📊 Supporting Classification Details")
+            lines.append("")
+            if core:
+                lines.append("**Core Invention:**")
+                for c in core:
+                    lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                lines.append("")
+            if support:
+                lines.append("**Enabling Technology:**")
+                for c in support:
+                    lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                lines.append("")
+            if context_codes:
+                lines.append("**Application Context:**")
+                for c in context_codes:
+                    lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                lines.append("")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _shorten(text: str, max_len: int = 80) -> str:
+        """Truncate text to max_len chars, adding ellipsis if needed."""
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3] + "..."

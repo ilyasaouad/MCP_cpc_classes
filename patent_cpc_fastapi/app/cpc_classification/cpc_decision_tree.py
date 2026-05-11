@@ -12,9 +12,37 @@ DESIGN PRINCIPLES:
 """
 
 import logging
+import re
 from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+FORCE_SOFTWARE_CORE = "FORCE_SOFTWARE_CORE"
+FORCE_DOMAIN_CORE = "FORCE_DOMAIN_CORE"
+HYBRID_INVENTION = "HYBRID_INVENTION"
+
+TCR_FORCE_THRESHOLDS = {
+    FORCE_SOFTWARE_CORE: 2.0,
+    FORCE_DOMAIN_CORE: 0.5,
+}
+
+CPC_PRIORITY_BY_FORCE = {
+    FORCE_SOFTWARE_CORE: {
+        "primary": ["G06F", "G06N", "G06K", "G06Q", "G10L", "G06V"],
+        "secondary": ["G05B", "G10L"],
+        "deprioritize": ["A61", "B23", "B60", "F16", "C08", "H02"],
+    },
+    FORCE_DOMAIN_CORE: {
+        "primary": ["A61", "B23", "B60", "F16", "C08", "E21", "H01"],
+        "secondary": ["G06F", "G05B"],
+        "deprioritize": ["G06N", "G06V"],
+    },
+    HYBRID_INVENTION: {
+        "primary": ["G06F", "G06N"],
+        "secondary": ["G05B", "G10L", "G06V"],
+        "deprioritize": [],
+    },
+}
 
 
 # Domain mapping: domain name -> CPC families
@@ -107,6 +135,121 @@ FUNCTIONAL_BOOSTS = {
     "valve": {"F16K": 1.5, "F16": 1.3},
     "medical imaging": {"A61B5/": 1.5, "A61B": 1.3},
     "diagnosis": {"A61B5/": 1.5, "A61B": 1.3},
+}
+
+# ── FUNCTIONAL VERB FILTER (Prompt 2 Fix) ──
+#
+# Use "What the invention DOES" (verbs) to override "What it mentions" (nouns)
+# Core technical verbs map to CPC requirements with 2.0x multiplier
+
+FUNCTIONAL_VERB_BOOSTS = {
+    # Verbs indicating interpretation/generation -> NLP/Speech processing
+    "interpreting": {
+        "families": ["G06F40", "G10L", "G06N"],
+        "boost": 2.0,
+        "description": "Interpreting input to produce understanding",
+    },
+    "generating": {
+        "families": ["G06F40", "G10L", "G06N"],
+        "boost": 2.0,
+        "description": "Generating output from input",
+    },
+    "recognizing": {
+        "families": ["G06V", "G10L", "G06K"],
+        "boost": 2.0,
+        "description": "Recognition tasks",
+    },
+    "understanding": {
+        "families": ["G06F40", "G06N"],
+        "boost": 2.0,
+        "description": "Semantic understanding",
+    },
+    "processing": {
+        "families": ["G06F", "G06T", "G10L"],
+        "boost": 1.5,
+        "description": "General processing",
+    },
+    "analyzing": {
+        "families": ["G06F", "G06T"],
+        "boost": 1.5,
+        "description": "Analysis tasks",
+    },
+    # Verbs indicating control/execution -> Vehicle control / Control systems
+    "controlling": {
+        "families": ["B60W", "G05B", "G05D"],
+        "boost": 2.0,
+        "description": "Control operations",
+    },
+    "executing": {
+        "families": ["B60W", "G05B"],
+        "boost": 2.0,
+        "description": "Executing commands/actions",
+    },
+    "regulating": {
+        "families": ["B60W", "G05B"],
+        "boost": 2.0,
+        "description": "Regulating systems",
+    },
+    "managing": {
+        "families": ["G05B", "G06F"],
+        "boost": 1.5,
+        "description": "System management",
+    },
+    "orchestrating": {
+        "families": ["G05B", "G06F"],
+        "boost": 1.5,
+        "description": "Orchestration coordination",
+    },
+    "scheduling": {
+        "families": ["G06F", "G05B"],
+        "boost": 1.5,
+        "description": "Scheduling operations",
+    },
+    # Verbs indicating learning/training -> Neural networks
+    "training": {
+        "families": ["G06N3/", "G06N"],
+        "boost": 2.0,
+        "description": "Model training",
+    },
+    "learning": {
+        "families": ["G06N", "G06F"],
+        "boost": 1.5,
+        "description": "Learning processes",
+    },
+    "optimizing": {
+        "families": ["G06N3/", "G06N"],
+        "boost": 2.0,
+        "description": "Optimization",
+    },
+    # Verbs indicating communication/transmission -> Telecom
+    "transmitting": {
+        "families": ["H04L", "H04W"],
+        "boost": 2.0,
+        "description": "Transmission",
+    },
+    "receiving": {
+        "families": ["H04L", "H04W"],
+        "boost": 1.5,
+        "description": "Receiving data",
+    },
+    "communicating": {
+        "families": ["H04L", "H04W"],
+        "boost": 1.5,
+        "description": "Communication",
+    },
+}
+
+# Keywords that should have REDUCED TF-IDF weight (keyword gravity)
+# These common nouns can cause drift if not explicitly in Technical Object
+AMBIGUOUS_NOUNS_GRAVITY = {
+    "state": 0.3,  # "state" in state machine vs. "vehicle state"
+    "switch": 0.4,  # "switch" in software switch vs. "circuit switch"
+    "voltage": 0.3,  # "voltage" in electrical vs. "voltage threshold"
+    "signal": 0.4,  # "signal" in data signal vs. "electrical signal"
+    "mode": 0.5,  # "mode" in operation mode vs. "circuit mode"
+    "level": 0.4,  # "level" in abstraction level vs. "signal level"
+    "control": 0.6,  # "control" in software control vs. "motor control"
+    "system": 0.5,  # "system" in software system vs. "control system"
 }
 
 # Object-aware disambiguation
@@ -845,6 +988,31 @@ TECHNICAL_CONTRIBUTION_MAP = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Indexing Code Detection
+# ─────────────────────────────────────────────────────────────────────
+
+_INDEXING_CODE_PATTERN = re.compile(r"^[A-Z]\d{2}[A-Z](2\d{3})")
+
+
+def _is_indexing_code(symbol: str) -> bool:
+    """
+    Detect CPC 'Secondary Indexing' codes (2xxx series).
+
+    Indexing codes have a 4-digit group number starting with '2' immediately
+    after the 4-character subclass prefix.  These are supplementary details,
+    NOT primary invention classifications.
+
+    Examples:
+        G05B2219/2652 → True   (2219 = indexing scheme for G05B)
+        G06F2221/2141 → True   (2221 = indexing scheme for G06F)
+        G05B19/418    → False  (19 = standard group)
+        G06F8/33      → False  (8 = standard group)
+        G06F40/30     → False  (40 = standard group)
+    """
+    return bool(_INDEXING_CODE_PATTERN.match(symbol))
+
+
 class CPCDecisionTreeConstraint:
     """
     Phase 3.5: Decision Tree Constraint Layer.
@@ -861,9 +1029,22 @@ class CPCDecisionTreeConstraint:
         self,
         ranked_candidates: List[Dict[str, Any]],
         phase1_data: Dict[str, Any],
+        layer_data: Optional[Dict[str, Any]] = None,
+        tcr_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Apply decision tree constraints to Phase 3 candidates.
+
+        Args:
+            ranked_candidates: CPC candidates from Phase 3
+            phase1_data: Phase 1 output
+            layer_data: Optional Phase 2A layer decomposition output
+                        If provided, uses multi-layer model instead of single-domain dominance.
+            tcr_result: Optional Technical Weight Analysis result (from technical_weight_analyzer.py)
+                        If provided, applies TCR-based precedence:
+                        - TCR > 2.0: FORCE_SOFTWARE_CORE (G06F/G06N priority)
+                        - TCR < 0.5: FORCE_DOMAIN_CORE (A/B/F sections priority)
+                        - 0.5 <= TCR <= 2.0: HYBRID_INVENTION (balanced)
 
         Returns:
             Dict with adjusted candidates, rules log, and domain decision.
@@ -874,11 +1055,40 @@ class CPCDecisionTreeConstraint:
         self.rules_log = []
         candidates = [dict(c) for c in ranked_candidates]  # Copy
 
-        # Step 1: Detect primary domain
+        # Step 0: TCR-based precedence (highest priority override)
+        tcr_force_flag = None
+        if tcr_result:
+            tcr_force_flag = tcr_result.get("force_flag", HYBRID_INVENTION)
+            logger.info(
+                "Phase 3.5: TCR force_flag=%s (TCR=%.3f)",
+                tcr_force_flag,
+                tcr_result.get("tcr", 1.0),
+            )
+            candidates = self._apply_tcr_precedence(candidates, tcr_result)
+
+        # Step 1: Detect primary domain (or layers)
         primary_domain, domain_confidence = self._detect_primary_domain(phase1_data)
 
-        # Step 2: Domain dominance constraint
-        if primary_domain and domain_confidence >= 0.6:
+        # Get all layer CPCs if layer data available
+        all_layer_cpcs = set()
+        if layer_data and layer_data.get("layers"):
+            for layer_name, layer_candidates in layer_data["layers"].items():
+                for cand in layer_candidates:
+                    sym = cand.get("symbol", "")
+                    if sym:
+                        all_layer_cpcs.add(sym[:3])  # Add family prefix
+                        all_layer_cpcs.add(sym[:4])  # Add 4-char prefix
+            logger.info(
+                "Phase 3.5: Layer-aware mode - accepting %d layer CPC prefixes",
+                len(all_layer_cpcs),
+            )
+
+        # Step 2: Layer-aware constraint (NO cross-layer penalties)
+        if layer_data and all_layer_cpcs:
+            # Multi-layer mode: accept candidates from ANY layer
+            candidates = self._apply_multi_layer_constraints(candidates, all_layer_cpcs)
+        elif primary_domain and domain_confidence >= 0.6:
+            # Single-domain mode (legacy): domain dominance
             candidates = self._apply_domain_dominance(
                 candidates, primary_domain, phase1_data
             )
@@ -888,6 +1098,13 @@ class CPCDecisionTreeConstraint:
 
         # Step 4: Functional boosting
         candidates = self._apply_functional_boosting(candidates, phase1_data)
+
+        # Step 4.25: FUNCTIONAL VERB FILTER (Prompt 2 Fix)
+        # Use verbs from core_function to override noun-based scoring
+        candidates = self._apply_verb_filter(candidates, phase1_data)
+
+        # Step 4.3: Keyword Gravity - reduce ambiguous noun weight
+        candidates = self._apply_keyword_gravity(candidates, phase1_data)
 
         # Step 4.5: Hierarchy priority (CRITICAL - prevents intra-domain drift)
         if primary_domain:
@@ -901,20 +1118,97 @@ class CPCDecisionTreeConstraint:
                 candidates, phase1_data, primary_domain
             )
 
-        # Step 5: Invalid class filtering
-        if primary_domain:
+        # Step 5: Invalid class filtering (only for single-domain mode)
+        if primary_domain and not layer_data:
             candidates = self._apply_invalid_filtering(candidates, primary_domain)
 
-        # Step 6: Multi-domain support
-        candidates = self._handle_multi_domain(candidates, phase1_data)
+        # Step 6: Multi-domain support (skip if already in layer mode)
+        if not layer_data:
+            candidates = self._handle_multi_domain(candidates, phase1_data)
 
         # Step 7: Normalization
         candidates = self._normalize_scores(candidates)
 
-        # Keep top 10
-        candidates = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[
-            :10
+        # Step 8: Tag each candidate as PRIMARY_STANDARD or SECONDARY_INDEXING
+        # Standard codes: main groups (e.g., G06F 8/447, G05B 19/042)
+        # Indexing codes: 2xxx series (e.g., G05B 2219/32134, G06F 2110/00)
+        for c in candidates:
+            c["code_type"] = (
+                "SECONDARY_INDEXING"
+                if _is_indexing_code(c.get("symbol", ""))
+                else "PRIMARY_STANDARD"
+            )
+
+        # Step 9: Canonical "Noun-First" Sorting
+        # Level 1: type — PRIMARY_STANDARD before SECONDARY_INDEXING
+        # Level 2: score — descending within each type group
+        candidates.sort(
+            key=lambda x: (
+                _is_indexing_code(x.get("symbol", "")),
+                -(x.get("score", 0)),
+            )
+        )
+
+        # Reserve top 20 for quota enforcement
+        pool = candidates[:20]
+        top5 = pool[:5]
+        standard_in_top5 = [c for c in top5 if c.get("code_type") == "PRIMARY_STANDARD"]
+        standard_below = [
+            c for c in pool[5:] if c.get("code_type") == "PRIMARY_STANDARD"
         ]
+
+        # Step 10: Quota Guardrail
+        # If top 5 are ALL SECONDARY_INDEXING, reach into positions 6-20
+        # to promote at least 2 PRIMARY_STANDARD codes into the top 5.
+        if len(standard_in_top5) < 2 and standard_below:
+            needed = 2 - len(standard_in_top5)
+            promoted = standard_below[:needed]
+            # Remove the lowest-scoring SECONDARY_INDEXING from top 5
+            top5_indexing = [
+                c for c in top5 if c.get("code_type") == "SECONDARY_INDEXING"
+            ]
+            top5_indexing.sort(key=lambda x: x.get("score", 0))
+            demoted = top5_indexing[:needed]
+
+            # Rebuild top 5 with promoted standards
+            kept_top5 = [c for c in top5 if c not in demoted]
+            rebuilt_top5 = kept_top5 + promoted
+            rebuilt_top5.sort(
+                key=lambda x: (
+                    _is_indexing_code(x.get("symbol", "")),
+                    -(x.get("score", 0)),
+                )
+            )
+
+            # Rebuild remaining pool
+            rest = [c for c in pool[5:] if c not in promoted] + demoted
+            rest.sort(
+                key=lambda x: (
+                    _is_indexing_code(x.get("symbol", "")),
+                    -(x.get("score", 0)),
+                )
+            )
+
+            candidates = rebuilt_top5 + rest[:5]
+            logger.info(
+                "Quota Guardrail: Promoted %d PRIMARY_STANDARD into top 5 → %s",
+                needed,
+                [c.get("symbol", "") for c in rebuilt_top5],
+            )
+        else:
+            candidates = pool[:10]
+
+        standard_count = sum(
+            1 for c in candidates if c.get("code_type") == "PRIMARY_STANDARD"
+        )
+        indexing_count = sum(
+            1 for c in candidates if c.get("code_type") == "SECONDARY_INDEXING"
+        )
+        logger.info(
+            "Phase 3.5 Canonical Sort: %d PRIMARY_STANDARD + %d SECONDARY_INDEXING in top 10",
+            standard_count,
+            indexing_count,
+        )
 
         return {
             "phase35_candidates": candidates,
@@ -922,7 +1216,57 @@ class CPCDecisionTreeConstraint:
             "phase35_domain": primary_domain,
             "phase35_domain_confidence": domain_confidence,
             "phase35_adjustments": len(self.rules_log),
+            "phase35_layer_mode": layer_data is not None and all_layer_cpcs,
+            "phase35_tcr": tcr_result.get("tcr") if tcr_result else None,
+            "phase35_tcr_force_flag": tcr_result.get("force_flag")
+            if tcr_result
+            else None,
         }
+
+    def _apply_multi_layer_constraints(
+        self,
+        candidates: List[Dict[str, Any]],
+        all_layer_cpcs: set,
+    ) -> List[Dict[str, Any]]:
+        """
+        Multi-layer constraint: Accept candidates from ANY active layer.
+        NO cross-layer penalties. NO forced hierarchy.
+
+        This is the key change for multi-layer patents like vehicle speech control.
+        """
+        adjusted = []
+
+        for candidate in candidates:
+            symbol = candidate.get("symbol", "")
+            score = candidate.get("score", 0)
+
+            # Check if candidate matches any layer
+            matches_layer = False
+            for cpc_prefix in all_layer_cpcs:
+                if symbol.startswith(cpc_prefix):
+                    matches_layer = True
+                    break
+
+            if matches_layer:
+                # Accept - no penalty, maybe slight boost
+                old_score = score
+                score *= 1.1  # 10% boost for layer match
+                self._log_rule(
+                    "LAYER_MATCH",
+                    symbol,
+                    old_score,
+                    score,
+                    f"Matches active layer CPC (no penalty)",
+                )
+            else:
+                # Neutral - accept but no boost
+                # DON'T penalize - the candidate might still be valid
+                pass  # Score unchanged
+
+            candidate["score"] = round(score, 4)
+            adjusted.append(candidate)
+
+        return adjusted
 
     def _detect_primary_domain(self, phase1_data: Dict[str, Any]) -> tuple:
         """Detect primary domain from Phase 1 data."""
@@ -980,6 +1324,81 @@ class CPCDecisionTreeConstraint:
             return best_domain[0], min(best_domain[1] / 3, 0.9)
 
         return None, 0.0
+
+    def _apply_tcr_precedence(
+        self,
+        candidates: List[Dict[str, Any]],
+        tcr_result: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Apply TCR-based precedence logic BEFORE other constraints.
+
+        TCR (Technical Character Ratio) determines whether the invention
+        is primarily computational (software) or physical (domain-specific).
+
+        Rules:
+        - TCR > 2.0 (FORCE_SOFTWARE_CORE): Boost G06F/G06N, penalize A/B/F sections
+        - TCR < 0.5 (FORCE_DOMAIN_CORE): Boost A/B/F sections, penalize G06N
+        - 0.5 <= TCR <= 2.0 (HYBRID_INVENTION): Balanced approach
+        """
+        force_flag = tcr_result.get("force_flag", HYBRID_INVENTION)
+        tcr = tcr_result.get("tcr", 1.0)
+        priority_map = CPC_PRIORITY_BY_FORCE.get(
+            force_flag, CPC_PRIORITY_BY_FORCE[HYBRID_INVENTION]
+        )
+
+        primary_families = priority_map["primary"]
+        secondary_families = priority_map["secondary"]
+        deprioritize_families = priority_map["deprioritize"]
+
+        logger.info(
+            "TCR_PRECEDENCE: force=%s, tcr=%.3f, primary=%s, deprioritize=%s",
+            force_flag,
+            tcr,
+            primary_families,
+            deprioritize_families,
+        )
+
+        adjusted = []
+        for candidate in candidates:
+            symbol = candidate.get("symbol", "")
+            score = candidate.get("score", 0)
+
+            if any(symbol.startswith(f) for f in primary_families):
+                old_score = score
+                score *= 2.0
+                self._log_rule(
+                    "TCR_PRIMARY",
+                    symbol,
+                    old_score,
+                    score,
+                    f"TCR={tcr:.2f}, force={force_flag}: primary family match",
+                )
+            elif any(symbol.startswith(f) for f in secondary_families):
+                old_score = score
+                score *= 1.3
+                self._log_rule(
+                    "TCR_SECONDARY",
+                    symbol,
+                    old_score,
+                    score,
+                    f"TCR={tcr:.2f}: secondary family match",
+                )
+            elif any(symbol.startswith(f) for f in deprioritize_families):
+                old_score = score
+                score *= 0.3
+                self._log_rule(
+                    "TCR_DEPRECATED",
+                    symbol,
+                    old_score,
+                    score,
+                    f"TCR={tcr:.2f}, force={force_flag}: deprioritized family",
+                )
+
+            candidate["score"] = round(score, 4)
+            adjusted.append(candidate)
+
+        return adjusted
 
     def _apply_domain_dominance(
         self,
@@ -1138,6 +1557,133 @@ class CPCDecisionTreeConstraint:
                                 score,
                                 f"Core function '{func_keyword}' matches {prefix}",
                             )
+
+            candidate["score"] = round(score, 4)
+            adjusted.append(candidate)
+
+        return adjusted
+
+    def _apply_verb_filter(
+        self,
+        candidates: List[Dict[str, Any]],
+        phase1_data: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        FUNCTIONAL VERB FILTER (Prompt 2 Fix).
+
+        Use "What the invention DOES" (verbs) to override "What it mentions" (nouns).
+        Extracts verbs from core_function and applies 2.0x multiplier to matching CPC families.
+
+        Verbs -> CPC mapping:
+        - "interpreting"/"generating" -> G06F40, G10L, G06N
+        - "controlling"/"executing" -> B60W, G05B
+        - "training"/"optimizing" -> G06N3/
+        - etc.
+        """
+        core_function = phase1_data.get("core_function", "").lower()
+
+        if not core_function:
+            return candidates
+
+        # Extract verbs from core_function
+        # Simple approach: check for known verb patterns
+        detected_verbs = []
+        for verb_key, config in FUNCTIONAL_VERB_BOOSTS.items():
+            if verb_key in core_function:
+                detected_verbs.append(verb_key)
+
+        if not detected_verbs:
+            return candidates
+
+        logger.info("VERB_FILTER: Detected verbs %s", detected_verbs)
+
+        adjusted = []
+        for candidate in candidates:
+            symbol = candidate.get("symbol", "")
+            score = candidate.get("score", 0)
+
+            best_boost = 1.0
+            best_verb = None
+
+            for verb in detected_verbs:
+                config = FUNCTIONAL_VERB_BOOSTS[verb]
+                families = config["families"]
+                boost = config["boost"]
+
+                if any(symbol.startswith(f) for f in families):
+                    if boost > best_boost:
+                        best_boost = boost
+                        best_verb = verb
+
+            if best_verb and best_boost > 1.0:
+                old_score = score
+                score *= best_boost
+                self._log_rule(
+                    "VERB_BOOST",
+                    symbol,
+                    old_score,
+                    score,
+                    f"Verb '{best_verb}' -> {best_boost}x boost",
+                )
+
+            candidate["score"] = round(score, 4)
+            adjusted.append(candidate)
+
+        return adjusted
+
+    def _apply_keyword_gravity(
+        self,
+        candidates: List[Dict[str, Any]],
+        phase1_data: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        KEYWORD GRAVITY (Prompt 2 Fix).
+
+        Reduce TF-IDF weight of common technical nouns that can cause drift.
+        Only applies reduction if the noun is NOT explicitly in Technical Object.
+
+        Examples:
+        - "state" in "state machine" -> OK
+        - "state" alone in terms -> reduce weight (0.3x)
+        - "switch" in "circuit switch" -> OK
+        - "switch" alone -> reduce weight (0.4x)
+        """
+        terms = phase1_data.get("terms", phase1_data.get("essential_terms", []))
+        technical_object = phase1_data.get("technical_object", "").lower()
+
+        if not terms:
+            return candidates
+
+        # Check which ambiguous nouns are in Technical Object (keep weight)
+        safe_nouns = set()
+        for noun in AMBIGUOUS_NOUNS_GRAVITY.keys():
+            if noun in technical_object:
+                safe_nouns.add(noun)
+
+        # Apply gravity to ambiguous nouns NOT in Technical Object
+        adjusted = []
+        for candidate in candidates:
+            symbol = candidate.get("symbol", "")
+            score = candidate.get("score", 0)
+
+            # Check if this candidate uses ambiguous terms
+            for noun, gravity in AMBIGUOUS_NOUNS_GRAVITY.items():
+                if noun in safe_nouns:
+                    continue  # Safe - explicitly mentioned in technical object
+
+                # Check if noun appears in candidate title
+                title = candidate.get("title", "").lower()
+                if noun in title:
+                    old_score = score
+                    score *= gravity
+                    self._log_rule(
+                        "KEYWORD_GRAVITY",
+                        symbol,
+                        old_score,
+                        score,
+                        f"Ambiguous noun '{noun}' (gravity={gravity})",
+                    )
+                    break  # Only apply once per candidate
 
             candidate["score"] = round(score, 4)
             adjusted.append(candidate)

@@ -200,7 +200,7 @@ class CPCHypothesisConsolidator:
     def __init__(
         self,
         max_hypotheses: int = 2,
-        max_candidates: int = 10,
+        max_candidates: int = 20,
         discard_threshold: float = 0.3,
     ):
         self.max_hypotheses = max_hypotheses
@@ -281,6 +281,9 @@ class CPCHypothesisConsolidator:
             "phase4_reasoning": self._build_overall_reasoning(
                 hypotheses, strong_clusters, support_weight
             ),
+            "phase4_interpretation": self._generate_interpretation(
+                hypotheses, support_weight, strong_clusters
+            ),
         }
 
         logger.info(
@@ -294,6 +297,119 @@ class CPCHypothesisConsolidator:
         )
 
         return result
+
+    def _generate_interpretation(
+        self,
+        hypotheses: List[Dict[str, Any]],
+        support_weight: float,
+        strong_clusters: List[CPCCluster],
+    ) -> Dict[str, Any]:
+        """
+        Generate a human-readable interpretation of Phase 4 metrics.
+
+        Analyzes Support Weight and Coherence to produce:
+        - A status label (clean / messy / weak)
+        - Descriptive insight text for each metric
+        - Actionable advice for proceeding or debugging
+        """
+        primary = hypotheses[0] if hypotheses else {}
+        primary_coherence = primary.get("coherence", 0.0)
+        primary_family = primary.get("family", "unknown")
+
+        # ── Support Weight interpretation ──
+        if support_weight > 0.5:
+            support_status = "clean"
+            support_text = (
+                f"**High Support Weight detected ({support_weight:.1%}).** "
+                "This indicates a 'Clean' patent. The system is confident that "
+                f"the invention resides in a single core technical family ({primary_family}), "
+                "successfully filtering out unrelated noise like Business Methods (G06Q) "
+                "or generic applications."
+            )
+        elif support_weight < 0.15:
+            support_status = "messy"
+            support_text = (
+                f"**Low Support Weight / High Dispersion ({support_weight:.1%}).** "
+                "The patent appears 'Messy' or 'Hybrid.' The search results are "
+                "scattered across multiple unrelated domains, which may suggest the "
+                "technical core is not yet clearly defined or is heavily polluted by "
+                "application-layer keywords."
+            )
+        else:
+            support_status = "moderate"
+            support_text = (
+                f"**Moderate Support Weight ({support_weight:.1%}).** "
+                f"The primary family ({primary_family}) has a reasonable share of "
+                "the candidate pool, but meaningful contributions exist in secondary "
+                "families. The patent may span multiple technical domains."
+            )
+
+        # ── Coherence interpretation ──
+        # Coherence range is 0.5–1.2 (mapped from avg lexical similarity)
+        if primary_coherence > 0.8:
+            coherence_status = "high"
+            coherence_text = (
+                f"**High Coherence ({primary_coherence:.2f}).** "
+                "The candidates in this cluster are 'Family Neighbors.' They don't just "
+                "share keywords; they reinforce each other's technical context, proving "
+                "that the system has found a stable technical 'niche'."
+            )
+        elif primary_coherence < 0.6:
+            coherence_status = "low"
+            coherence_text = (
+                f"**Low Coherence ({primary_coherence:.2f}).** "
+                "While these codes are in the same family, they are functionally distant. "
+                "This suggests the search is 'hallucinating' a connection between unrelated "
+                "technical features."
+            )
+        else:
+            coherence_status = "moderate"
+            coherence_text = (
+                f"**Moderate Coherence ({primary_coherence:.2f}).** "
+                "Candidates share some technical overlap but are not tightly clustered. "
+                "The classification is plausible but could benefit from refinement."
+            )
+
+        # ── Actionable Advice ──
+        if support_status == "clean" and coherence_status == "high":
+            actionable = (
+                "**Recommendation:** The classification is stable. "
+                "Proceed to Phase 5 (Technical Justification)."
+            )
+        elif support_status == "messy" and coherence_status == "low":
+            actionable = (
+                "**Recommendation:** Increase Phase 2C retrieval depth "
+                "or refine the technical anchors in Phase 2D. "
+                "Consider providing more specific patent claims text."
+            )
+        elif support_status == "clean" and coherence_status != "high":
+            actionable = (
+                "**Recommendation:** Support weight is strong but coherence is "
+                f"{coherence_status}. Consider running Phase 3.6 cross-domain "
+                "validation to tighten the candidate cluster."
+            )
+        elif support_status != "clean" and coherence_status == "high":
+            actionable = (
+                "**Recommendation:** Coherence is high but support is spread thin. "
+                "The primary family is well-defined but doesn't dominate the pool. "
+                "Refine Phase 2D anchors to reduce secondary-family noise."
+            )
+        else:
+            actionable = (
+                "**Recommendation:** Both metrics are moderate. "
+                "The classification is usable but not definitive. "
+                "Proceed to Phase 5 with caution."
+            )
+
+        return {
+            "support_status": support_status,
+            "support_text": support_text,
+            "coherence_status": coherence_status,
+            "coherence_text": coherence_text,
+            "actionable_advice": actionable,
+            "primary_coherence": round(primary_coherence, 4),
+            "primary_family": primary_family,
+        }
 
     def _cluster_candidates(self, candidates: List[Dict[str, Any]]) -> List[CPCCluster]:
         """Group candidates by family."""
