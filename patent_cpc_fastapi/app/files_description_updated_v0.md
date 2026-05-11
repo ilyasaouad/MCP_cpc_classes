@@ -4,7 +4,7 @@
 
 This directory contains the FastAPI backend for patent CPC (Cooperative Patent Classification) classification. The system uses a multi-phase pipeline separating **semantic understanding** (Phase 1) from **CPC classification** (Phases 2-8). The architecture is designed for production-grade CPC classification with deterministic scoring and constrained LLM usage.
 
-**Last Updated:** 2026-05-11
+**Last Updated:** 2026-05-12
 
 ---
 
@@ -32,8 +32,9 @@ app/
     ├── cpc_fast_index.py           # Fast indexing for CPC lookup
     ├── cpc_hierarchy_engine.py     # Phase 3.6: Universal hierarchy (DEPRECATED)
     ├── cpc_hypothesis_consolidation.py  # Phase 4: Cluster hypotheses
-    ├── cpc_hypothesis_resolver.py       # Phase 5: Deterministic resolver
-    ├── cpc_role_labeling.py        # Phase 8: 3-layer role labeling (NEW)
+    ├── cpc_hypothesis_resolver.py       # Phase 5: Deterministic resolver + Tri-Pillar
+    ├── cpc_phase2d_anchor.py          # Phase 2D: Subclass structural anchor filter (NEW)
+    ├── cpc_role_labeling.py           # Phase 8: 3-layer role labeling + Executive Report
     ├── cpc_xml_parser.py           # XML parser for CPC scheme files
     ├── epo_client.py              # EPO API client (optional/experimental)
     ├── extracting_cpc.py          # Phase 1: Semantic extraction only
@@ -75,21 +76,20 @@ app/
 ### `search_cpc.py`
 **Purpose:** Main pipeline orchestrator - coordinates all classification phases (Phases 1-8)
 
-**Pipeline Phases:**
+**Pipeline Phases (Current):**
 1. **Phase 1** - Semantic extraction (terms, context, function) - **NO CPC codes**
 2. **Phase 1.5** - Invention role classification (CORE_TECH/SYSTEM/APPLICATION/SUPPORT)
-3. **Phase 2A** - Layer Decomposition: multi-layer CPC mapping (REPLACED family routing)
-4. **Phase 2B** - Restricted XML expansion (only within Phase 2A families)
-5. **Phase 2C** - TF-IDF scoring with term matching + cross-domain guardrails
-6. **Phase 3** - Rank top 10 candidates
-7. **Phase 3.5** - Decision Tree Constraint Layer (domain dominance + verb filter + keyword gravity)
-8. **Phase 3.6** - Cross-Domain Validation Layer (entity table + layer validation)
-9. **Phase 4** - Hypothesis consolidation: clusters into max 2 hypotheses
-10. **Phase 5** - Deterministic resolution: selects exactly 1 primary
-11. **Phase 6** - Claim reconciliation (optional, per-claim CPC assignment)
-12. **Phase 7** - Final consistency check (coherence + recommendations)
-13. **Phase 7.5** - Feedback Loop: re-filter using Phase 7 recommendations
-14. **Phase 8** - Role Labeling: CORE/SUPPORT/CONTEXT/LEGAL_COVERAGE + Explanation Graph
+3. **TCR** - Technical Weight Analysis (computational vs physical dominance)
+4. **Phase 2A** - Layer Decomposition: multi-layer CPC mapping (pure_software, data_reasoning, interaction, control, application)
+5. **Phase 2B** - Restricted XML expansion (only within technical-layer 4-char prefixes, pre-filtered to existing XML files)
+6. **Phase 2C** - Hybrid Scoring: TF-IDF (bigrams) + Semantic Embeddings (0.4×TF-IDF + 0.6×Semantic) + Find-Until-Full expansion (500→1000→all)
+7. **Phase 2D** - Subclass Structural Anchor: filters candidates against Phase 2A technical-layer anchors, excludes non-technical families (G06Q, etc.)
+8. **Phase 3** - Rank top 20 candidates
+9. **Phase 3.5** - Decision Tree: domain dominance, disambiguation, canonical sorting (standard before indexing), quota guardrail
+10. **Phase 3.6** - Cross-Domain Validation: entity table, layer validation, family lock
+11. **Phase 4** - Hypothesis consolidation: clusters into max 2 hypotheses + interpretation engine
+12. **Phase 5** - Deterministic resolution + Tri-Pillar FACETS (Goal/Method/Context) + back-scanning
+13. **Phase 8** - Executive Classification Report: At-a-Glance card, Tech Stack table, Professional Justification, Suggested Indexing Codes, Download button
 
 **Key Class:** `CPCClassifier`
 - Accepts optional `knowledge_graph` parameter
@@ -553,40 +553,48 @@ EPO_API_KEY=your_key_here
    - technical_object, core_function, domain_signals, terms
    - primary_domain, disambiguated_terms, negative_signals
    |
-3. Phase 2A: Family Router selects top 3 CPC families
-   - Uses KG embeddings OR domain signal heuristics
-   - Hard constraints prevent cross-domain leakage
-   - Distinguishes purpose vs tool domains
+3. Phase 1.5: Invention role classification (CORE_TECH/SYSTEM/APPLICATION/SUPPORT)
    |
-4. Phase 2B: Restricted XML expansion (only within selected families)
-   - Reduces search space ~98%
+4. TCR: Technical Weight Analysis (computational vs physical)
    |
-5. Phase 2C: TF-IDF scoring with term matching + cross-domain guardrails
+5. Phase 2A: Layer Decomposition — multi-layer CPC mapping
+   - Only technical layers used for anchor extraction (excludes application)
    |
-6. Phase 3: Rank top 10 candidates
+6. Phase 2B: XML expansion restricted to technical-layer 4‑char prefixes
+   - Pre-filtered to only existing XML files on disk
+   - Per-class expansion counts logged
    |
-7. Phase 3.5: Decision Tree Constraint Layer
-   - Domain dominance, disambiguation, functional boosting
-   - Hierarchy priority (Level 1-4), contribution filter
+7. Phase 2C: Hybrid Scoring (TF-IDF bigrams + Semantic Embeddings)
+   - Scores ALL expanded candidates, no truncation
    |
-8. Phase 3.6: Cross-Domain Validation Layer
-   - Domain anchor check, anti-collapse rules
-   - Entity consistency (prompt → NLP, not speech)
-   - Family lock (≥2 signals required)
+8. Phase 2D: Subclass Anchor Filter
+   - Keeps only candidates whose 4-char prefix matches technical layer anchors
+   - Find-Until-Full: progressive expansion [500→1000→all] until ≥20 survivors
    |
-9. Phase 4: Consolidate into max 2 hypotheses
-   - Cluster by family, compute normalized scores
-   - PRIMARY + optional SECONDARY (no tertiary)
+9. Phase 3: Rank top 20 survivors
    |
-10. Phase 5: Deterministic resolution
-    - Select exactly 1 primary (+ optional secondary if gap < 0.25)
-    - Score-driven, no LLM classification
+10. Phase 3.5: Decision Tree — domain dominance, disambiguation, canonical sorting
+    - Standard codes (PRIMARY_STANDARD) before indexing codes (SECONDARY_INDEXING)
+    - Quota guardrail ensures ≥2 standard codes in top 5
     |
-11. Phase 8: Role Labeling (NEW)
-    - Assign CORE / SUPPORT / CONTEXT / LEGAL_COVERAGE roles
-    - Build 3-layer explanation graph
+11. Phase 3.6: Cross-Domain Validation
+    - Domain anchor check, anti-collapse, entity consistency
     |
-12. Return JSON with layered CPC model and reasoning traces
+12. Phase 4: Hypothesis Consolidation + Interpretation
+    - Clusters into max 2 hypotheses (PRIMARY + optional SECONDARY)
+    - Human-readable health analysis (support weight + coherence)
+    |
+13. Phase 5: Deterministic Resolution + Tri-Pillar FACETS
+    - Selects primary hypothesis
+    - Back-scans Phase 2C raw candidates for G06F, G06N, G05B champions
+    - Output: Premier code + Facets (Goal / Method / Context)
+    |
+14. Phase 8: Executive Classification Report
+    - At-a-Glance card with Premier code + confidence badge
+    - Tech Stack table from Phase 5 facets
+    - Professional Justification (LLM narrative)
+    - Suggested Indexing Codes (copy-paste ready)
+    - Download button for Markdown export
 ```
 
 ---
@@ -761,3 +769,144 @@ transformers     - Cross-encoder models (NEW)
 - `search_cpc.py` — Added `import numpy`, `_tokenize_with_bigrams()`, `_make_term_bigrams()`, `_compute_semantic_scores()`, hybrid scoring (both paths), bigram matching (both paths), precision fix, K=20 expansion
 - `cpc_hypothesis_consolidation.py` — `max_candidates: 10 → 20`
 - `streamlit_app.py` — Phase-by-phase display, Phase 2C caption update, score margin precision
+
+---
+
+## Recent Changes (2026-05-11 — Continued)
+
+### Phase 2D: Subclass Structural Anchor (NEW)
+
+- **`cpc_phase2d_anchor.py`**: New module — `Phase2DSubclassAnchor` class
+  - Extracts 4-character CPC subclass prefixes (e.g., G06F, G10L, G06N) from Phase 2A technical layers (pure_software, data_reasoning, interaction, control)
+  - Strictly excludes application-layer codes and 3-digit broad classes
+  - Filters Phase 2C candidates: keeps only those whose prefix matches the anchor set
+  - Excludes non-technical families: G06Q, G06C, G07F, G07G, G09F, G09B, A63F
+  - Falls back to family router output if layer decomposition unavailable (uses `_FAMILY_TO_SUBCLASS` mapping)
+  - Maintains hybrid scores (0.4×TF-IDF + 0.6×Semantic) from Phase 2C
+  - Outputs purified top 20 candidates for Phase 3
+- **`search_cpc.py`**: Phase 2D integrated between Phase 2C and Phase 3 in both `classify()` and `classify_from_phase1()` paths
+- **`streamlit_app.py`**: Added Phase 2D display section — anchor subclasses count, kept/discarded metrics, discard log expander
+
+### Phase 2B/2C: Combined Classes Pollution Fix
+
+- **`search_cpc.py`**: Fixed critical bug — `merge_layers_to_family_list()` returned ALL layer symbols including application-layer families (G06Q, B60W, B60R, A61, etc.)
+  - When `graph_classes` was empty (KG not loaded), `combined_classes` fell back to this polluted list
+  - `parse_file("G06Q")` found the G06Q XML file and flooded the candidate pool with business-method codes
+  - Fix: Extract `allowed_roots` from technical layers only (pure_software, data_reasoning, interaction, control) using `[A-Z]\d{2}[A-Z]` regex
+  - `combined_classes` fallback now uses `allowed_roots` (clean prefixes) instead of raw `top_cpc_families`
+  - XML expansion restricted to technical subclasses only (G06F, G10L, G06N, G05B)
+
+### Phase 2B: Pre-filtering + Per-Class Expansion Logging
+
+- **`search_cpc.py`**: Added pre-filtering of `combined_classes` to only include codes with actual XML files on disk
+  - Checks `cpc-scheme-{code}.xml` existence before attempting `parse_file()`
+  - Codes without XML files (e.g., G05D, G06K) are skipped with a warning
+  - `allowed_roots` filtered to match valid combined classes
+  - Per-class expansion counts collected: `phase2b_expansion_counts` dict {prefix: subgroup_count}
+  - Log example: `Phase 2B: Expanded 847 subgroups across 4 families: {G05B: 45, G06F: 320, G06N: 332, G10L: 150}`
+- **`streamlit_app.py`**: Phase 2B display updated — shows per-family expansion breakdown as metrics, skipped classes warning
+
+### Phase 2C: Deep Retrieval (K=20 → 100) + Find-Until-Full
+
+- **`search_cpc.py`**: Both `classify()` and `classify_from_phase1()` changed `scored[:20]` → `scored[:100]`
+  - Phase 2C now scores top 100 candidates (was 20)
+  - Phase 2D `max_result` changed from 50 → 100
+  - Find-Until-Full progressive expansion loop: [500, 1000, all]
+    - Normalize ALL scored candidates into `all_candidates`
+    - Pass top 500 → Phase 2D → ≥20 survivors? STOP
+    - Pass top 1000 → Phase 2D → ≥20 survivors? STOP
+    - Pass ALL → Phase 2D → whatever survives
+  - Log: `"Deep Search required. Scanned 500 to find X valid technical anchors."` or `"Find-Until-Full: Scanned 500 to find 20 valid technical anchors. ✓ Quota met."`
+  - `find_until_full_log` stored in result dict for Streamlit display
+- **`streamlit_app.py`**: Phase 2C display updated — shows "Total Scored" metric + Find-Until-Full expansion log
+
+### Phase 3.5: Canonical Sorting — Standard Codes Before Indexing Codes
+
+- **`cpc_decision_tree.py`**: Added `_is_indexing_code(symbol)` helper function
+  - Regex pattern: `^[A-Z]\d{2}[A-Z](2\d{3})` — detects 2xxx-series indexing codes (e.g., G05B2219/..., G06F2221/...)
+  - Standard codes: G06F 8/xx, G05B 19/xx → `PRIMARY_STANDARD`
+  - Indexing codes: G05B 2219/..., G06F 2110/... → `SECONDARY_INDEXING`
+  - Each candidate tagged with `code_type` field
+- **Step 9: Canonical "Noun-First" Sorting**:
+  - Level 1: type — PRIMARY_STANDARD before SECONDARY_INDEXING
+  - Level 2: score — descending within each type group
+  - Reserves top 20 for quota enforcement
+- **Step 10: Quota Guardrail**: If top 5 are ALL SECONDARY_INDEXING, reaches into positions 6-20 to promote at least 2 PRIMARY_STANDARD codes into top 5
+- **`streamlit_app.py`**: Phase 3.5 candidates split into "Core Invention (Standard Codes)" and "Technical Details (Indexing Codes)" sections
+
+### Phase 4: Human-Readable Interpretation Engine
+
+- **`cpc_hypothesis_consolidation.py`**: Added `_generate_interpretation()` method to `CPCHypothesisConsolidator`
+  - Analyzes Support Weight and Coherence to produce human-readable insights
+  - **Support Weight** thresholds: >50% → "Clean" patent, <15% → "Messy/Hybrid"
+  - **Coherence** thresholds: >0.8 → "Family Neighbors" (stable niche), <0.6 → "Hallucinating connection"
+  - **Actionable Advice**: Both high → "Proceed to Phase 5", Both low → "Increase Phase 2C retrieval depth"
+  - Result stored in `phase4_interpretation` field
+- **`streamlit_app.py`**: Phase 4 now shows "[INSIGHT] Classification Health Analysis" block with icon-badged insights and actionable advice
+
+### Phase 5: Tri-Pillar Classification + FACETS Display
+
+- **`cpc_hypothesis_resolver.py`**: Major upgrade — Tri-Pillar Resolution
+  - Added `PILLAR_DEFINITIONS` with three functional roles:
+    - `pillar1_goal`: Primary Function (G06F, G06Q) — core technical result
+    - `pillar2_method`: Methodology (G06N) — AI/ML implementation
+    - `pillar3_context`: Application Domain (G05B, B60W, A61B, H02J) — industrial environment
+  - `resolve()` now accepts `all_raw_candidates` parameter for back-scanning
+  - `_resolve_pillars()`: Finds highest-scoring champion per pillar from Phase 2C raw candidates
+  - `_find_champion_in_pool()`: Static method — scans candidates by family prefix
+  - Each pillar result includes `source` field: `"phase2c_back_scan"` or `"not_found"`
+- **`search_cpc.py`**: Passes `all_candidates` to resolver: `resolver.resolve(phase4_result, phase1, all_candidates)`
+- **Phase 5 UI Refinement** (`streamlit_app.py`):
+  - Premier CPC Classification shown first (renamed caption: "Phase 7 Logic Reconciliation")
+  - Renamed `[PILLARS]` → `[FACETS] Cross-Domain Classifications`
+  - Primary Facet shown as top header; Methodological and Application facets grouped under collapsible "Supporting Technical Facets"
+  - Tooltips added: "Core technical result", "AI/ML implementation strategy", "Target hardware/industrial environment"
+  - `[INFO] No secondary family` → `"Classification Health: Primary focus confirmed. High signal separation detected"`
+
+### Pipeline Optimization: Phase 6 & 7 Decommissioned
+
+- **`search_cpc.py`**: Removed Phase 6 (Per-Claim Classification) processing entirely
+  - Removed `reconciled_claims` variable and LLM reconciliation call
+  - Removed Phase 7/7.5 labels — consistency logic still runs internally for Premier/Phase 8
+  - Removed `result["phase7"]` and `result["per_claim"]` from output
+  - Premier assignment moved before result dict construction for proper data flow
+- **`streamlit_app.py`**: Phases 6 and 7 removed from PHASES list and display blocks
+  - Phase 7 raw JSON debug expander removed
+  - Pipeline now: Phase 1 → 1.5 → TCR → 2A → 2B → 2C → 2D → 3 → 3.5 → 3.6 → 4 → 5 → 8 (13 phases)
+
+### Phase 8: Executive Classification Report
+
+- **`search_cpc.py`**: `_build_formatted_report()` completely rewritten
+  - Now accepts `pillars` (Phase 5 facets) and `premier` (main recommendation) parameters
+  - Generates structured Markdown report with 5 sections:
+    1. **Main Recommendation** — Premier code + confidence badge
+    2. **🛠 Technical Breakdown** — Facets table (Primary Goal / AI Methodology / Domain Context)
+    3. **💡 Professional Justification** — LLM summary or fallback from facets
+    4. **📋 Suggested Indexing Codes** — Non-pillar codes from Core/Support/Context/Coverage layers
+    5. **📊 Supporting Classification Details** — Condensed layer breakdown
+  - Added `_shorten()` static method for text truncation
+- **`streamlit_app.py`**: Phase 8 redesigned as Executive Card layout
+  - **At-a-Glance Card**: Premier code in large bold font with confidence badge (✅ High / 🔶 Medium / ⚠️ Low)
+  - **🛠 Technical Breakdown**: DataFrame table showing facets by role
+  - **💡 Professional Justification**: LLM-generated reasoning or fallback
+  - **📋 Suggested Indexing Codes** (collapsible): Copy-paste ready CPC references
+  - **📊 Full Classification Report** (collapsible): Raw Markdown report
+  - **📊 Supporting Classification Details** (collapsible): Core/Support/Context/Coverage breakdown
+  - **📥 Download Executive Report (Markdown)**: Download button using `st.download_button()`
+
+### Added
+- `cpc_phase2d_anchor.py` — Phase 2D: Subclass Structural Anchor filter
+- `_tokenize_with_bigrams()` and `_make_term_bigrams()` functions in `search_cpc.py`
+- `_compute_semantic_scores()` method in `CPCClassifier`
+- `_is_indexing_code()` helper in `cpc_decision_tree.py`
+- `_generate_interpretation()` method in `CPCHypothesisConsolidator`
+- `_resolve_pillars()` and `_find_champion_in_pool()` methods in `CPCHypothesisResolver`
+- `PILLAR_DEFINITIONS` constant in `cpc_hypothesis_resolver.py`
+- `_shorten()` static method in `CPCClassifier`
+
+### Modified
+- `search_cpc.py` — Hybrid scoring (0.4 TF-IDF + 0.6 semantic), bigrams, precision fix, K=20→100, combined_classes pollution fix, pre-filtering, per-class expansion counts, Find-Until-Full loop, Phase 2D integration, Phase 6/7 removal, `_build_formatted_report()` rewrite, premier data flow
+- `cpc_hypothesis_consolidation.py` — `max_candidates: 10 → 20`, added `_generate_interpretation()`
+- `cpc_hypothesis_resolver.py` — Tri-Pillar resolution, pillar definitions, `all_raw_candidates` parameter, facet labels
+- `cpc_decision_tree.py` — `_is_indexing_code()`, canonical sorting, quota guardrail, code_type tagging
+- `streamlit_app.py` — Phase-by-phase display, Phase 2B expansion breakdown, Phase 2C Find-Until-Full log, Phase 2D anchor filter, Phase 3.5 standard/indexing split, Phase 4 interpretation engine, Phase 5 FACETS display + Premier first, Phase 6/7 removal, Phase 8 Executive Card with download button
