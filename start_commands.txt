@@ -6,7 +6,8 @@ FastAPI:
 source .venv/Script/activate
 /AI-projects/patent_cpc_fastapi (master)
 
-$ python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000 
+
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000 
 
 
 Streamlit:

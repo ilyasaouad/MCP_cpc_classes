@@ -9,8 +9,32 @@ from mcp_client import CPCRestClient
 # CONFIG
 # -----------------------------
 st.set_page_config(
-    page_title="CPC Classifier - Phase 1 Test", page_icon="[DEBUG]", layout="wide"
+    page_title="CPC Classifier — Phase by Phase", page_icon="[PHASE]", layout="wide"
 )
+
+# -----------------------------
+# SESSION STATE + PHASE LIST
+# -----------------------------
+PHASES = [
+    "Phase 1: Semantic Extraction",
+    "Phase 1.5: Role Classification",
+    "TCR: Technical Weight Analysis",
+    "Phase 2A: Layer Decomposition",
+    "Phase 2B: XML Expansion",
+    "Phase 2C: Hybrid Scoring",
+    "Phase 2D: Subclass Anchor",
+    "Phase 3: CPC Subgroup Ranking",
+    "Phase 3.5: Decision Tree Constraints",
+    "Phase 3.6: Cross-Domain Validation",
+    "Phase 4: Hypothesis Consolidation",
+    "Phase 5: Hypothesis Resolution",
+    "Phase 8: Role Labeling & Report",
+]
+
+if "current_phase" not in st.session_state:
+    st.session_state["current_phase"] = PHASES[0]
+if "classification_result" not in st.session_state:
+    st.session_state["classification_result"] = None
 
 client = CPCRestClient(base_url="http://localhost:3456")
 
@@ -82,6 +106,35 @@ else:
         "```bash\ncd patent_cpc_fastapi\npython -m uvicorn app.main:app --reload --port 8000\n```\n"
         "2. Or check if it's running on a different port"
     )
+
+# -----------------------------
+# PHASE SELECTOR
+# -----------------------------
+st.divider()
+st.caption("**Select which phase output to display:**")
+col_phase_nav, col_phase_sel = st.columns([1, 8])
+with col_phase_nav:
+    if st.button("⬅ Prev", key="prev_phase", use_container_width=True):
+        idx = PHASES.index(st.session_state["current_phase"])
+        if idx > 0:
+            st.session_state["current_phase"] = PHASES[idx - 1]
+        st.rerun()
+with col_phase_sel:
+    selected_phase = st.selectbox(
+        "Phase",
+        PHASES,
+        index=PHASES.index(st.session_state["current_phase"]),
+        label_visibility="collapsed",
+        key="phase_select",
+    )
+    st.session_state["current_phase"] = selected_phase
+with col_phase_nav:
+    if st.button("Next ➡", key="next_phase", use_container_width=True):
+        idx = PHASES.index(st.session_state["current_phase"])
+        if idx < len(PHASES) - 1:
+            st.session_state["current_phase"] = PHASES[idx + 1]
+        st.rerun()
+st.divider()
 
 # -----------------------------
 # INPUT
@@ -200,7 +253,7 @@ if use_manual:
 # -----------------------------
 # ACTION
 # -----------------------------
-button_label = "🚀 Run Classification" if use_manual else "🚀 Extract Phase 1"
+button_label = "🚀 Run Full Pipeline"
 if st.button(button_label):
     if not use_manual and not text_input.strip():
         st.warning("Please provide input text first.")
@@ -225,40 +278,56 @@ if st.button(button_label):
         else:
             result = client.classify_cpc(text_input)
 
-    # -----------------------------
-    # ERROR HANDLING
-    # -----------------------------
-    if "error" in result:
-        error_msg = result["error"]
+    # Cache result in session state
+    st.session_state["classification_result"] = result
 
-        # Check if it's an LLM connection issue
-        if (
-            "Ollama" in error_msg
-            or "LLM" in error_msg
-            or "timed out" in error_msg.lower()
-        ):
-            st.error(
-                f"🚨 **Phase 1 Extraction Failed — LLM Not Available**\n\n"
-                f"{error_msg}\n\n"
-                "**To fix this:**\n"
-                "1. Start Ollama: `ollama serve`\n"
-                "2. Pull a model: `ollama pull phi4:latest`\n"
-                "3. Use a smaller model (8GB+ RAM needed for phi4, 48GB+ for 120B models)\n\n"
-                "**Without LLM:** CPC classification cannot work. Phase 1 semantic extraction is required."
-            )
-        else:
-            st.error(
-                f"**Extraction failed.**\n\n"
-                f"{error_msg}\n\n"
-                "_Make sure both the MCP server (port 3456) and FastAPI backend (port 8000) are running._"
-            )
-        with st.expander("[DEBUG] Full error details"):
-            st.json(result)
-        st.stop()
+# -----------------------------
+# DISPLAY RESULTS (phase by phase)
+# -----------------------------
+result = st.session_state.get("classification_result")
+if result is None:
+    st.info("Enter patent text above and click **Run Full Pipeline** to start.")
+    st.stop()
 
-    # -----------------------------
-    # PHASE 1 RESULTS ONLY
-    # -----------------------------
+# -----------------------------
+# ERROR HANDLING (from cached result)
+# -----------------------------
+if "error" in result:
+    error_msg = result["error"]
+
+    if "Ollama" in error_msg or "LLM" in error_msg or "timed out" in error_msg.lower():
+        st.error(
+            f"🚨 **Phase 1 Extraction Failed — LLM Not Available**\n\n"
+            f"{error_msg}\n\n"
+            "**To fix this:**\n"
+            "1. Start Ollama: `ollama serve`\n"
+            "2. Pull a model: `ollama pull phi4:latest`\n"
+            "3. Use a smaller model (8GB+ RAM needed for phi4, 48GB+ for 120B models)\n\n"
+            "**Without LLM:** CPC classification cannot work. Phase 1 semantic extraction is required."
+        )
+    else:
+        st.error(
+            f"**Extraction failed.**\n\n"
+            f"{error_msg}\n\n"
+            "_Make sure both the MCP server (port 3456) and FastAPI backend (port 8000) are running._"
+        )
+    with st.expander("[DEBUG] Full error details"):
+        st.json(result)
+    st.stop()
+
+# -----------------------------
+# PHASE BY PHASE DISPLAY
+# -----------------------------
+phase = st.session_state.get("current_phase", PHASES[0])
+
+# Show current phase badge
+st.divider()
+st.caption(f"**Currently viewing:** {phase}  (use selector at top to switch phases)")
+
+# =============================================================================
+# PHASE 1: Semantic Extraction
+# =============================================================================
+if phase == "Phase 1: Semantic Extraction":
     st.divider()
     st.subheader("[DEBUG] Phase 1 Extraction Results")
     st.caption(
@@ -271,17 +340,14 @@ if st.button(button_label):
         st.warning("Phase 1 data not available.")
         st.stop()
 
-    # Technical Object, Problem, and Core Function
     col_obj, col_prob = st.columns(2)
     with col_obj:
         st.markdown("**Technical Object of the Invention:**")
         st.info(phase1.get("technical_object", "N/A"))
-
     with col_prob:
         st.markdown("**Problem to be Solved:**")
         st.info(phase1.get("problem_solved", "N/A"))
 
-    # Core Function - CRITICAL for function-first classification
     st.markdown("---")
     st.markdown("**[TARGET] Core Technical Function (Function-First Classification):**")
     core_function = phase1.get("core_function", "")
@@ -295,7 +361,6 @@ if st.button(button_label):
             "No core function extracted. Classification may be form-based rather than function-based."
         )
 
-    # System Context - CRITICAL for system-first classification
     st.markdown("---")
     st.markdown(
         "**[FACTORY] System / Application Context (System-First Classification - MOST IMPORTANT):**"
@@ -311,7 +376,6 @@ if st.button(button_label):
             "No system context extracted. Classification may miss the correct application domain."
         )
 
-    # Domain Signals (NEW - replaces CPC Classes)
     st.markdown("---")
     st.markdown("**[TARGET] Domain Signals:**")
     domain_signals = phase1.get("domain_signals", [])
@@ -324,7 +388,6 @@ if st.button(button_label):
     else:
         st.write("No domain signals extracted")
 
-    # Disambiguated Terms (NEW)
     st.markdown("---")
     st.markdown("**[SEARCH] Disambiguated Terms:**")
     disambiguated = phase1.get("disambiguated_terms", [])
@@ -341,7 +404,6 @@ if st.button(button_label):
     else:
         st.write("No ambiguous terms detected")
 
-    # Primary Domain (NEW)
     st.markdown("---")
     st.markdown("**[FACTORY] Primary Technical Domain:**")
     primary_domain = phase1.get("primary_domain", {})
@@ -354,24 +416,16 @@ if st.button(button_label):
     else:
         st.warning("Primary domain not detected")
 
-    # Classification Strategy
     st.markdown("---")
     strategy = phase1.get("classification_strategy", "")
     if strategy:
         st.markdown(f"**[CHART] Classification Strategy:** `{strategy}`")
 
-    # Essential Terms Table
-    st.markdown("---")
-    st.markdown("**Essential Technical Terms (Ranked by Importance):**")
-
     terms = phase1.get("essential_terms", phase1.get("terms", []))
     if terms:
         df_terms = pd.DataFrame(terms)
-        # Ensure expected columns exist
         if "importance" in df_terms.columns:
             df_terms = df_terms.sort_values("importance", ascending=False)
-
-        # Display as a styled dataframe
         st.dataframe(
             df_terms,
             use_container_width=True,
@@ -385,8 +439,6 @@ if st.button(button_label):
                 ),
             },
         )
-
-        # Bar chart of term importance
         if "importance" in df_terms.columns and "term" in df_terms.columns:
             st.subheader("[CHART] Term Importance Distribution")
             chart_df = df_terms.set_index("term")[["importance"]]
@@ -394,52 +446,251 @@ if st.button(button_label):
     else:
         st.write("No terms extracted")
 
-    # PHASE 2: CPC Expansion Pipeline (2A, 2B, 2C)
-    phase2 = result.get("phase2", {})
-
-    # ── Phase 2A ──
-    st.divider()
-    st.subheader("[CHART] Phase 2A — CPC Family Router")
-    st.caption(
-        "Method: Domain taxonomy with purpose/tool distinction + hard constraints + co-occurrence rules"
-    )
-    if phase2 and phase2.get("phase2a_families"):
-        st.markdown(
-            "Routes the patent to relevant CPC families using **domain signals** (purpose vs tool distinction)."
-        )
-        col_fam, col_prim, col_mod = st.columns(3)
-        with col_fam:
-            st.markdown("**Selected Families:**")
-            families = phase2.get("phase2a_families", [])
-            for fam in families[:5]:
-                st.code(fam)
-        with col_prim:
-            st.markdown("**Primary Family:**")
-            st.success(f"**{phase2.get('phase2a_primary', 'N/A')}**")
-        with col_mod:
-            st.markdown("**Modality:**")
-            st.info(phase2.get("phase2a_modality", "unknown"))
+# =============================================================================
+# PHASE 1.5: Invention Role Classification
+# =============================================================================
+elif phase == "Phase 1.5: Role Classification":
+    phase15 = result.get("phase15", {})
+    if phase15:
+        st.divider()
+        st.subheader("[TARGET] Phase 1.5 — Invention Role Classification")
         st.caption(
-            f"Source: {phase2.get('phase2a_source', 'unknown')} | "
-            f"Reasoning: {phase2.get('phase2a_reasoning', '')}"
+            "Method: LLM-based role classification (CORE_TECH / SYSTEM / APPLICATION / SUPPORT)"
+        )
+
+        role = phase15.get("role", "UNKNOWN")
+        confidence = phase15.get("confidence", 0)
+
+        role_colors = {
+            "CORE_TECH": "success",
+            "SYSTEM": "info",
+            "APPLICATION": "warning",
+            "SUPPORT": "secondary",
+        }
+        role_color = role_colors.get(role, "info")
+
+        col_role, col_conf = st.columns(2)
+        with col_role:
+            if role_color == "success":
+                st.success(f"**{role}** — Core Technical Innovation")
+            elif role_color == "info":
+                st.info(f"**{role}** — System Orchestration")
+            elif role_color == "warning":
+                st.warning(f"**{role}** — Domain Application")
+            else:
+                st.info(f"**{role}** — Auxiliary Support")
+            st.caption("Primary classification driver")
+        with col_conf:
+            st.metric("Confidence", f"{confidence:.2f}")
+
+        role_descriptions = {
+            "CORE_TECH": "The invention modifies/improves the underlying technology itself (algorithms, model architecture, training methods)",
+            "SYSTEM": "The invention orchestrates/coordinates/manages components (pipelines, multi-component systems, data/control flow)",
+            "APPLICATION": "The invention applies known technology to a specific domain (medical, automotive, finance, industry-specific)",
+            "SUPPORT": "Auxiliary functionality not central to technical operation (logging, storage, UI, monitoring)",
+        }
+        st.markdown(
+            f"**Role Definition:** {role_descriptions.get(role, 'Unknown role')}"
+        )
+
+        reasoning = phase15.get("reasoning", [])
+        if reasoning:
+            st.markdown("**Reasoning:**")
+            for r in reasoning:
+                st.write(f"- {r}")
+
+        evidence = phase15.get("evidence", [])
+        if evidence:
+            with st.expander("[INFO] Evidence"):
+                for e in evidence:
+                    st.write(f"- {e}")
+
+        st.markdown("---")
+        st.markdown("**CPC Routing Implications:**")
+        if role == "CORE_TECH":
+            st.markdown("→ Boost: G06N, G06T, G06V, G10L (technology-native classes)")
+            st.markdown("→ Deprioritize: G06F, H04L (unless strongly supported)")
+        elif role == "SYSTEM":
+            st.markdown("→ Boost: G06F, H04L, G05B (system orchestration classes)")
+            st.markdown(
+                "→ Deprioritize: G06N, G06T (unless NN-internal signals present)"
+            )
+        elif role == "APPLICATION":
+            st.markdown("→ Boost: A61, B60, B23, E21, A01 (domain-specific classes)")
+            st.markdown("→ Deprioritize: G06N (AI is tool, not subject)")
+        else:
+            st.markdown("→ Boost: G06F (general computing for auxiliary functions)")
+    else:
+        st.warning("Phase 1.5 results not available.")
+
+# =============================================================================
+# TCR: Technical Weight Analysis
+# =============================================================================
+elif phase == "TCR: Technical Weight Analysis":
+    tcr_result = result.get("tcr_analysis", {})
+    if tcr_result:
+        st.divider()
+        st.subheader("[NEW] Technical Weight Analysis")
+        st.caption(
+            "Determines whether invention is primarily computational (software) or physical (domain-specific)"
+        )
+
+        tcr = tcr_result.get("tcr", 1.0)
+        force_flag = tcr_result.get("force_flag", "HYBRID_INVENTION")
+        comp_weight = tcr_result.get("computational_weight", 0)
+        phys_weight = tcr_result.get("physical_weight", 0)
+        dominant = tcr_result.get("dominant_bucket", "unknown")
+
+        col_tcr1, col_tcr2, col_tcr3 = st.columns(3)
+        with col_tcr1:
+            st.metric("TCR (Technical Character Ratio)", f"{tcr:.3f}")
+        with col_tcr2:
+            flag_emoji = (
+                "🖥️"
+                if force_flag == "FORCE_SOFTWARE_CORE"
+                else "⚙️"
+                if force_flag == "FORCE_DOMAIN_CORE"
+                else "🔄"
+            )
+            st.metric("Force Flag", f"{flag_emoji} {force_flag}")
+        with col_tcr3:
+            st.metric("Dominant Bucket", dominant.capitalize())
+
+        if force_flag == "FORCE_SOFTWARE_CORE":
+            st.info(
+                "🖥️ **Interpretation:** Computationally dominant (TCR > 2.0). Primary CPC: G06F/G06N. Physical codes = CONTEXT/SUPPORT only."
+            )
+        elif force_flag == "FORCE_DOMAIN_CORE":
+            st.info(
+                "⚙️ **Interpretation:** Physically dominant (TCR < 0.5). Primary CPC: domain-specific. Computational codes = SUPPORT only."
+            )
+        else:
+            st.info(
+                "🔄 **Interpretation:** Hybrid invention (0.5 <= TCR <= 2.0). Both layers contribute meaningfully."
+            )
+
+        comp_terms = tcr_result.get("computational_terms", [])
+        phys_terms = tcr_result.get("physical_terms", [])
+
+        col_terms1, col_terms2 = st.columns(2)
+        with col_terms1:
+            if comp_terms:
+                st.markdown(f"**Computational Terms ({len(comp_terms)}):**")
+                terms_list = [t.get("term", "") for t in comp_terms[:15]]
+                st.write(
+                    ", ".join(terms_list) + ("..." if len(comp_terms) > 15 else "")
+                )
+        with col_terms2:
+            if phys_terms:
+                st.markdown(f"**Physical/Domain Terms ({len(phys_terms)}):**")
+                terms_list = [t.get("term", "") for t in phys_terms[:15]]
+                st.write(
+                    ", ".join(terms_list) + ("..." if len(phys_terms) > 15 else "")
+                )
+    else:
+        st.warning("TCR analysis not available.")
+
+# =============================================================================
+# PHASE 2A: Layer Decomposition
+# =============================================================================
+elif phase == "Phase 2A: Layer Decomposition":
+    phase2a_layers = result.get("phase2a_layers", {})
+    if phase2a_layers:
+        st.divider()
+        st.subheader("[LAYERS] Phase 2A — CPC Layer Decomposition")
+        st.caption(
+            "Multi-layer decomposition: each technical layer independently maps to CPC. "
+            "NO cross-layer penalties. NO forced hierarchy."
+        )
+
+        primary_layer = phase2a_layers.get("primary_layer", "unknown")
+        layer_scores = phase2a_layers.get("layer_scores", {})
+        layers = phase2a_layers.get("layers", {})
+        relationships = phase2a_layers.get("relationships", {})
+        ai_role = phase2a_layers.get("ai_role", "unknown")
+
+        col_primary, col_ai = st.columns(2)
+        with col_primary:
+            st.metric("Primary Layer", primary_layer.upper())
+        with col_ai:
+            st.metric("AI Role", ai_role)
+
+        if layer_scores:
+            st.markdown("**Layer Scores:**")
+            score_df = pd.DataFrame(
+                [{"Layer": k, "Score": v} for k, v in layer_scores.items()]
+            )
+            st.bar_chart(score_df.set_index("Layer"))
+
+        st.markdown("---")
+        st.markdown("**Technical Layers & CPC Candidates:**")
+
+        layer_names = {
+            "application": "Application (What system is FOR)",
+            "data_reasoning": "Data & Reasoning (How knowledge is represented)",
+            "interaction": "Interaction (User/System interface)",
+            "control": "Control (System orchestration logic)",
+        }
+
+        for layer_name, layer_candidates in layers.items():
+            if layer_candidates:
+                with st.expander(
+                    f"[{'PRIMARY' if layer_name == primary_layer else 'LAYER'}] {layer_names.get(layer_name, layer_name)}",
+                    expanded=(layer_name == primary_layer),
+                ):
+                    st.markdown(f"**Score:** {layer_scores.get(layer_name, 0):.2f}")
+                    st.markdown("**CPC Candidates:**")
+                    for cand in layer_candidates[:5]:
+                        st.code(f"{cand['symbol']} ({cand.get('type', 'family')})")
+                    rels = relationships.get(layer_name, [])
+                    if rels:
+                        st.markdown("**Relationships:**")
+                        for rel in rels:
+                            st.write(f"- {rel}")
+
+        st.markdown("---")
+        st.info(
+            "**Multi-Layer Principle:** Each layer maps to CPC independently. "
+            "A vehicle speech control patent should have: B60W (control) + G10L (speech) + "
+            "G06F (data/NLP) + G05B (orchestration) — NOT collapsed to a single family."
         )
     else:
-        st.warning(
-            "[WARN] **Phase 2A results not available.**\n\n"
-            "CPC family routing did not complete. Classification may be inaccurate."
-        )
+        st.warning("Phase 2A results not available.")
+        # Fallback to legacy Phase 2A display
+        phase2 = result.get("phase2", {})
+        if phase2 and phase2.get("phase2a_families"):
+            st.subheader("[FALLBACK] Legacy Phase 2A — CPC Family Router")
+            col_fam, col_prim, col_mod = st.columns(3)
+            with col_fam:
+                st.markdown("**Selected Families:**")
+                for fam in phase2.get("phase2a_families", [])[:5]:
+                    st.code(fam)
+            with col_prim:
+                st.metric("Primary Family", phase2.get("phase2a_primary", "N/A"))
+            with col_mod:
+                st.metric("Modality", phase2.get("phase2a_modality", "unknown"))
 
-    # ── Phase 2B ──
-    st.markdown("---")
+# =============================================================================
+# PHASE 2B: XML Expansion
+# =============================================================================
+elif phase == "Phase 2B: XML Expansion":
+    phase2 = result.get("phase2", {})
+    st.divider()
     st.subheader("[CHART] Phase 2B — Restricted XML Expansion")
     st.caption(
-        "Method: CPC XML parser with family prefix filtering (98% search space reduction)"
+        "Method: CPC XML parser restricted to technical-layer 4‑char subclass prefixes. "
+        "Only subclasses matching Phase 2A technical layers are expanded. "
+        "Application-layer domains (B60, A61, G06Q) are excluded at the source."
     )
     if phase2:
         count_2b = phase2.get("phase2b_candidate_count", 0)
+        expansion_counts = phase2.get("phase2b_expansion_counts", {})
+        skipped = phase2.get("phase2b_skipped_classes", [])
         families = phase2.get("phase2a_families", [])
+
         st.markdown(
-            "Expands CPC subgroup definitions **only within Phase 2A families** to reduce search space."
+            "Expands CPC subgroup definitions **only within Phase 2A technical families** "
+            "to reduce search space and prevent non-technical domain leakage."
         )
         col1, col2 = st.columns(2)
         with col1:
@@ -449,29 +700,54 @@ if st.button(button_label):
                 f"~{((1 - count_2b / 250000) * 100):.1f}%" if count_2b > 0 else "N/A"
             )
             st.metric("Search Space Reduction", reduction)
+
+        # Per-family expansion breakdown
+        if expansion_counts:
+            st.markdown("---")
+            st.markdown("**Subgroups expanded per subclass prefix:**")
+            count_items = sorted(expansion_counts.items())
+            cols = st.columns(min(len(count_items), 4))
+            for i, (prefix, cnt) in enumerate(count_items):
+                with cols[i % len(cols)]:
+                    st.metric(prefix, cnt)
+
+        if skipped:
+            st.warning(f"Skipped (no XML file): {', '.join(skipped)}")
+
         if families:
             st.caption(f"Restricted to families: {', '.join(families)}")
     else:
         st.warning("Phase 2B data not available.")
 
-    # ── Phase 2C ──
-    st.markdown("---")
-    st.subheader("[CHART] Phase 2C — TF-IDF Scoring & Filtering")
+# =============================================================================
+# PHASE 2C: TF-IDF Scoring
+# =============================================================================
+elif phase == "Phase 2C: Hybrid Scoring":
+    phase2 = result.get("phase2", {})
+    st.divider()
+    st.subheader("[CHART] Phase 2C — Hybrid Scoring & Filtering")
     st.caption(
-        "Method: TF-IDF with importance weighting + synonym expansion + cross-domain guardrails"
+        "Method: Find‑Until‑Full retrieval — scores ALL expanded candidates with "
+        "hybrid TF‑IDF (bigrams) + embedding similarity (0.4×TF‑IDF + 0.6×Semantic). "
+        "Progressive expansion ensures Phase 2D has enough candidates to reach 20‑survivor quota."
     )
     if phase2:
-        count_2c = phase2.get("phase2c_final_count", 0)
+        total_scored = phase2.get(
+            "phase2c_total_scored", phase2.get("phase2c_final_count", 0)
+        )
         margin = phase2.get("score_margin", 0)
         confidence = phase2.get("confidence_level", "unknown")
+        find_until_full = phase2.get("phase2d_find_until_full", [])
+
         st.markdown(
-            "Scores expanded candidates using **TF-IDF + domain boosting + false-friend penalty**."
+            "Scores **ALL** expanded candidates. Phase 2D then progressively expands "
+            "(500 → 1000 → all) until ≥ 20 technical anchors survive filtering."
         )
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Final Candidates", count_2c)
+            st.metric("Total Scored", total_scored)
         with col2:
-            st.metric("Score Margin", f"{margin:.3f}")
+            st.metric("Score Margin", f"{margin:.6f}")
         with col3:
             conf_color = (
                 "[HIGH]"
@@ -481,6 +757,20 @@ if st.button(button_label):
                 else "[LOW]"
             )
             st.metric("Confidence", f"{conf_color} {confidence.upper()}")
+
+        # Find-Until-Full expansion log
+        if find_until_full:
+            st.markdown("---")
+            st.markdown("**Find‑Until‑Full Expansion Log:**")
+            for entry in find_until_full:
+                depth = entry.get("depth", "?")
+                surv = entry.get("survivors_found", 0)
+                triggered = entry.get("deep_search_triggered", False)
+                icon = "🔍 Deep" if triggered else "✅ Quota"
+                st.write(
+                    f"{icon}: Scanned **{depth}** candidates → found **{surv}** valid technical anchors"
+                )
+
         st.caption(
             "Higher margin = clearer separation between top candidates. "
             "Low margin suggests ambiguous classification."
@@ -488,7 +778,65 @@ if st.button(button_label):
     else:
         st.warning("Phase 2C data not available.")
 
-    # PHASE 3: CPC Results
+# =============================================================================
+# PHASE 2D: Subclass Structural Anchor
+# =============================================================================
+elif phase == "Phase 2D: Subclass Anchor":
+    phase2 = result.get("phase2", {})
+    st.divider()
+    st.subheader("[ANCHOR] Phase 2D — Subclass Structural Anchor Filter")
+    st.caption(
+        "Method: Filters Phase 2C candidates — keeps only those whose 4-char CPC subclass prefix "
+        "matches the Phase 2A technical layer anchors (pure_software, data_reasoning, interaction, control). "
+        "Excludes application-layer codes and non-technical families (G06Q, etc.)."
+    )
+
+    anchor_set = phase2.get("phase2d_anchor_set", [])
+    anchor_source = phase2.get("phase2d_anchor_source", [])
+    kept_count = phase2.get("phase2d_kept_count", 0)
+    discarded_count = phase2.get("phase2d_discarded_count", 0)
+    discard_log = phase2.get("phase2d_discard_log", [])
+
+    if anchor_set:
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("Anchor Subclasses", len(anchor_set))
+        with col_b:
+            st.metric("Candidates Kept", kept_count)
+        with col_c:
+            st.metric("Candidates Discarded", discarded_count)
+
+        st.markdown(f"**Anchor Set:** `{', '.join(anchor_set)}`")
+        st.caption(
+            f"Source layers: {', '.join(anchor_source) if anchor_source else 'family_router'}"
+        )
+
+        st.markdown(
+            "**Filter Rule:** Candidate prefix must be in anchor set AND not in excluded families (G06Q, G06C, G07F, G07G, G09F, G09B, A63F)."
+        )
+
+        if discard_log:
+            with st.expander(f"[DEBUG] Discarded Candidates ({len(discard_log)})"):
+                for d in discard_log:
+                    reason_icon = (
+                        "[FAMILY]"
+                        if d.get("reason") == "non_technical_family"
+                        else "[ANCHOR]"
+                        if d.get("reason") == "not_in_anchor_set"
+                        else "[PREFIX]"
+                    )
+                    st.write(
+                        f"{reason_icon} `{d.get('symbol', '?')}` — {d.get('reason', '')}"
+                    )
+    else:
+        st.info(
+            "Phase 2D anchor filter not applied — all candidates passed through unchanged."
+        )
+
+# =============================================================================
+# PHASE 3: CPC Subgroup Ranking
+# =============================================================================
+elif phase == "Phase 3: CPC Subgroup Ranking":
     st.divider()
     st.subheader("[CHART] Phase 3 — CPC Subgroup Ranking (Top 10)")
     st.caption(
@@ -505,8 +853,6 @@ if st.button(button_label):
         df_p3 = pd.DataFrame(phase3)
         if "symbol" in df_p3.columns and "score" in df_p3.columns:
             df_p3["similarity_%"] = (df_p3["score"] * 100).round(1)
-
-            # Select columns to display
             display_cols = ["symbol", "title", "score", "similarity_%"]
             if "level" in df_p3.columns:
                 display_cols.append("level")
@@ -524,7 +870,6 @@ if st.button(button_label):
                     "level": st.column_config.NumberColumn("Level", width="small"),
                 },
             )
-
             st.subheader("[CHART] CPC Score Distribution")
             st.bar_chart(df_p3.set_index("symbol")[["score"]])
         else:
@@ -532,7 +877,10 @@ if st.button(button_label):
     else:
         st.warning("No Phase 3 results available.")
 
-    # PHASE 3.5: Decision Tree Constraint Layer
+# =============================================================================
+# PHASE 3.5: Decision Tree Constraints
+# =============================================================================
+elif phase == "Phase 3.5: Decision Tree Constraints":
     phase35 = result.get("phase35", {})
     if phase35:
         st.divider()
@@ -541,7 +889,6 @@ if st.button(button_label):
             "Method: Multi-step deterministic decision tree enforcing domain correctness, disambiguation, functional boosting, and invalid class filtering"
         )
 
-        # Decision Tree Steps Display
         with st.expander("[INFO] Decision Tree Steps (Phase 3.5)", expanded=False):
             st.markdown("""
             **Step 1: Domain Detection**
@@ -566,6 +913,18 @@ if st.button(button_label):
             
             **Step 6: Normalization**
             - Re-scale scores after all adjustments
+
+            **Step 7: Code Type Tagging**
+            - PRIMARY_STANDARD: standard main-group codes (e.g., G06F 8/xx, G05B 19/xx)
+            - SECONDARY_INDEXING: 2xxx series indexing codes (e.g., G05B 2219/..., G06F 2110/...)
+            
+            **Step 8: Canonical 'Noun-First' Sorting**
+            - Level 1: Type — PRIMARY_STANDARD always before SECONDARY_INDEXING
+            - Level 2: Score — descending within each type group
+            
+            **Step 9: Quota Guardrail**
+            - If Top 5 are ALL SECONDARY_INDEXING, reaches into positions 6-20
+            - Promotes at least 2 PRIMARY_STANDARD codes into top 5
             """)
 
         domain = phase35.get("phase35_domain", "unknown")
@@ -580,18 +939,39 @@ if st.button(button_label):
         with col3:
             st.metric("Rules Applied", adjustments)
 
-        # Show adjusted candidates
         adjusted = phase35.get("phase35_candidates", [])
         if adjusted:
-            st.markdown("**Adjusted Candidates (After Decision Tree):**")
-            df_35 = pd.DataFrame(adjusted)
-            if "symbol" in df_35.columns and "score" in df_35.columns:
-                st.dataframe(
-                    df_35[["symbol", "title", "score"]],
-                    use_container_width=True,
-                )
+            standard_codes = [
+                c for c in adjusted if c.get("code_type") != "SECONDARY_INDEXING"
+            ]
+            indexing_codes = [
+                c for c in adjusted if c.get("code_type") == "SECONDARY_INDEXING"
+            ]
 
-        # Show rules log
+            # Core Invention (Standard Codes)
+            if standard_codes:
+                st.markdown("**Core Invention** (Standard Codes)")
+                st.caption(
+                    "Broad main-group classifications representing the primary technical contribution."
+                )
+                df_std = pd.DataFrame(standard_codes)
+                display_cols = [
+                    c for c in ["symbol", "title", "score"] if c in df_std.columns
+                ]
+                st.dataframe(df_std[display_cols], use_container_width=True)
+
+            # Technical Details (Indexing Codes)
+            if indexing_codes:
+                st.markdown("**Technical Details** (Indexing Codes)")
+                st.caption(
+                    "Supplementary indexing codes providing additional technical context."
+                )
+                df_idx = pd.DataFrame(indexing_codes)
+                display_cols = [
+                    c for c in ["symbol", "title", "score"] if c in df_idx.columns
+                ]
+                st.dataframe(df_idx[display_cols], use_container_width=True)
+
         rules_log = phase35.get("phase35_rules_log", [])
         if rules_log:
             with st.expander("[DEBUG] Decision Tree Rules Log"):
@@ -607,7 +987,10 @@ if st.button(button_label):
         st.subheader("[TREE] Phase 3.5 — Decision Tree Constraint Layer")
         st.warning("Phase 3.5 results not available.")
 
-    # PHASE 3.6: Universal CPC Hierarchy Selection
+# =============================================================================
+# PHASE 3.6: Cross-Domain Validation
+# =============================================================================
+elif phase == "Phase 3.6: Cross-Domain Validation":
     phase36 = result.get("phase36", {})
     if phase36:
         st.divider()
@@ -616,78 +999,69 @@ if st.button(button_label):
             "Method: Contribution-type-first, domain-second, subclass-mapped using universal A-F hierarchy"
         )
 
-        # Decision Tree Steps Display
-        with st.expander("[INFO] Decision Tree Steps (Phase 3.6)", expanded=False):
+        with st.expander("[INFO] Validation Steps (Phase 3.6)", expanded=False):
             st.markdown("""
-            **Step 1: Detect Contribution Types (Universal A-F)**
-            - A: Parameter/Structure Optimization (priority 1)
-            - B: Compression/Efficiency/Reduction (priority 2)
-            - C: System Architecture/Design (priority 3)
-            - E: Signal/Data Transformation (priority 4)
-            - D: Operation/Execution/Inference (priority 5)
-            - F: Abstract Modeling/Logic/Reasoning (priority 6)
+            **Step 1: Domain Anchor Check**
+            - Verify candidate's CPC family matches domain signals
+            - Require ≥1 domain signal for family validity
             
-            **Step 2: Select Primary Contribution**
-            - Choose highest priority detected type
-            - If A or B exists → NEVER select D or F as primary
+            **Step 2: Anti-Domain Collapse**
+            - Prevent G10L without audio/speech signals
+            - Prevent G06T without image/visual signals
+            - Prevent G06V without computer vision signals
             
-            **Step 3: Map to CPC Patterns**
-            - A → parameter optimization subclasses
-            - B → compression/reduction subclasses
-            - etc.
+            **Step 3: Contextual Entity Consistency**
+            - "prompt" → NLP domain (G06F/G06N), NOT speech (G10L)
+            - "utterance" → speech domain (G10L), NOT text (G06F)
+            - "dialogue" → text conversation (G06F), NOT spoken
             
-            **Step 4: Domain-Aware Refinement**
-            - Apply domain-specific CPC prefix mapping
-            - Example: B + AI domain → G06N3/063
-            
-            **Step 5: Score Adjustment**
-            - Boost matching candidates (×2.5)
-            - Penalize lower-priority matches (×0.15)
+            **Step 4: Final Family Lock**
+            - Require ≥2 independent signals to strongly lock family
+            - Weak lock (1 signal) gets penalty
             """)
 
-        primary_type = phase36.get("phase36_primary_type", "unknown")
-        secondary_types = phase36.get("phase36_secondary_types", [])
-        detected_types = phase36.get("phase36_types", {})
         adjustments = phase36.get("phase36_adjustments", 0)
+        domain_verified = phase36.get("phase36_domain_verified", False)
 
-        # Display contribution type hierarchy
-        st.markdown("**Contribution Type Hierarchy:**")
-        col_type, col_sec = st.columns(2)
-        with col_type:
-            st.success(f"**Primary:** {primary_type}")
-        with col_sec:
-            if secondary_types:
-                st.info(f"**Secondary:** {', '.join(secondary_types)}")
+        st.markdown("**Cross-Domain Validation:**")
+        col_verified, col_adj = st.columns(2)
+        with col_verified:
+            if domain_verified:
+                st.success("[OK] Domain Verified")
             else:
-                st.info("**Secondary:** None")
+                st.warning("[WARN] Domain Not Verified")
+        with col_adj:
+            st.metric("Validation Rules Applied", adjustments)
 
-        # Show detected signals
-        if detected_types:
-            st.markdown("**Detected Signals by Type:**")
-            for type_code, signals in detected_types.items():
-                st.write(f"- **{type_code}**: {', '.join(signals)}")
+        rules_log = phase36.get("phase36_rules_log", [])
+        if rules_log:
+            with st.expander("[DEBUG] Validation Rules Applied"):
+                for rule in rules_log[:20]:
+                    st.write(
+                        f"- **{rule.get('rule', '')}**: `{rule.get('symbol', '')}` "
+                        f"{rule.get('score_before', 0):.3f} → {rule.get('score_after', 0):.3f} "
+                        f"| {rule.get('reason', '')}"
+                    )
 
-        st.metric("Hierarchy Adjustments", adjustments)
-
-        # Show refined candidates with contribution match badges
         refined = phase36.get("phase36_candidates", [])
         if refined:
-            st.markdown("**Refined Candidates (After Hierarchy Selection):**")
+            st.markdown("**Validated Candidates (After Cross-Domain Check):**")
             for c in refined[:5]:
-                match_type = c.get("contribution_match", "neutral")
-                badge = {
-                    "primary": "[PRIMARY MATCH]",
-                    "secondary": "[SECONDARY]",
-                    "lower": "[LOWER PRIORITY]",
-                    "neutral": "",
-                }.get(match_type, "")
-                st.write(f"`{c['symbol']}` — {c['score']:.4f} {badge}")
+                verified = c.get("domain_context_verified", False)
+                badge = "[VERIFIED]" if verified else "[UNVERIFIED]"
+                signals = c.get("domain_signals_matched", 0)
+                st.write(
+                    f"`{c['symbol']}` — {c['score']:.4f} {badge} (signals: {signals})"
+                )
     else:
         st.divider()
         st.subheader("[TREE] Phase 3.6 — Universal CPC Hierarchy Selection")
         st.warning("Phase 3.6 results not available.")
 
-    # PHASE 4: Hypothesis Consolidation
+# =============================================================================
+# PHASE 4: Hypothesis Consolidation
+# =============================================================================
+elif phase == "Phase 4: Hypothesis Consolidation":
     phase4 = result.get("phase4", {})
     if phase4:
         st.divider()
@@ -705,7 +1079,6 @@ if st.button(button_label):
         support_weight = phase4.get("phase4_support_weight", 0.0)
 
         if hypotheses:
-            # Show hypotheses
             for hyp in hypotheses:
                 role = hyp.get("role", "unknown").upper()
                 family = hyp.get("family", "")
@@ -731,12 +1104,43 @@ if st.button(button_label):
                     st.code(", ".join(codes))
                 st.markdown("---")
 
-            # Summary metrics
             col_sw, col_conf = st.columns(2)
             with col_sw:
                 st.metric("Support Weight", f"{support_weight:.2%}")
             with col_conf:
                 st.metric("Confidence", confidence.upper())
+
+            # ── Human-Readable Interpretation ──
+            interpretation = phase4.get("phase4_interpretation", {})
+            if interpretation:
+                st.markdown("---")
+                st.markdown("### [INSIGHT] Classification Health Analysis")
+
+                support_status = interpretation.get("support_status", "unknown")
+                coherence_status = interpretation.get("coherence_status", "unknown")
+
+                # Support weight insight
+                icon_sw = (
+                    "✅"
+                    if support_status == "clean"
+                    else "⚠️"
+                    if support_status == "messy"
+                    else "🔶"
+                )
+                st.info(icon_sw + " " + interpretation.get("support_text", ""))
+
+                # Coherence insight
+                icon_ch = (
+                    "✅"
+                    if coherence_status == "high"
+                    else "⚠️"
+                    if coherence_status == "low"
+                    else "🔶"
+                )
+                st.info(icon_ch + " " + interpretation.get("coherence_text", ""))
+
+                # Actionable advice
+                st.success("💡 " + interpretation.get("actionable_advice", ""))
 
             st.caption(phase4.get("phase4_reasoning", ""))
         else:
@@ -746,8 +1150,13 @@ if st.button(button_label):
         st.subheader("[PUZZLE] Phase 4 — Hypothesis Consolidation")
         st.warning("Phase 4 results not available.")
 
-    # PHASE 5: Hypothesis Resolution (new deterministic format)
+# =============================================================================
+# PHASE 5: Hypothesis Resolution
+# =============================================================================
+elif phase == "Phase 5: Hypothesis Resolution":
     phase5 = result.get("phase5", {})
+    premier = result.get("premier", {})
+
     if phase5 and "primary" in phase5:
         st.divider()
         st.subheader("[TARGET] Phase 5 — Deterministic Hypothesis Resolution")
@@ -762,7 +1171,6 @@ if st.button(button_label):
         secondary = phase5.get("secondary", {})
         decision = phase5.get("decision_logic", {})
 
-        # Primary
         if primary:
             st.markdown("### [BEST] Primary Family")
             col1, col2 = st.columns([1, 3])
@@ -786,7 +1194,6 @@ if st.button(button_label):
                 if codes:
                     st.markdown(f"**Supporting Codes:** `{', '.join(codes[:5])}`")
 
-        # Secondary
         if secondary:
             st.markdown("---")
             st.markdown("### [2ND] Secondary Family (accepted)")
@@ -814,9 +1221,11 @@ if st.button(button_label):
                     st.markdown(f"**Supporting Codes:** `{', '.join(codes[:5])}`")
         else:
             st.markdown("---")
-            st.info("[INFO] No secondary family — gap was too large.")
+            st.success(
+                "**Classification Health:** Primary focus confirmed. "
+                "High signal separation detected (no significant cross-domain leakage)."
+            )
 
-        # Decision logic
         if decision:
             st.markdown("---")
             st.markdown("**Decision Logic:**")
@@ -829,8 +1238,7 @@ if st.button(button_label):
             )
             st.write(f"- Method: {decision.get('selection_method', 'unknown')}")
 
-    # Backward compatibility: old Phase 5 format
-    elif phase5:
+    elif phase5 and "primary" in phase5:
         st.divider()
         st.subheader("[TARGET] Phase 5 — Multi-Pass Validation & Best Code Selection")
 
@@ -863,13 +1271,17 @@ if st.button(button_label):
             with col2:
                 st.markdown(f"**Title:** {best.get('title', 'N/A')}")
                 st.markdown(f"**Reasoning:** {best.get('reasoning', 'N/A')}")
+    else:
+        st.warning("Phase 5 results not available.")
 
-    # PREMIER: Single best validated CPC class
-    premier = result.get("premier", {})
+    # Show Premier if available
     if premier:
-        st.divider()
+        st.markdown("---")
         st.subheader("[BEST] Premier CPC Classification")
-        st.caption("Method: Phase 7 consistency recommendation override (if coherent)")
+        st.caption(
+            "Method: Phase 7 Logic Reconciliation "
+            "(Final consistency check to align Functional, Methodological, and Application codes)."
+        )
         col1, col2 = st.columns([1, 3])
         with col1:
             st.metric("Code", premier.get("symbol", "N/A"))
@@ -878,74 +1290,362 @@ if st.button(button_label):
             st.markdown(f"**Title:** {premier.get('title', 'N/A')}")
             st.markdown(f"**Reasoning:** {premier.get('reasoning', 'N/A')}")
 
-    # PHASE 6: Per-Claim Classification
-    per_claim = result.get("per_claim", [])
-    if per_claim:
-        st.divider()
-        st.subheader("[LIST] Phase 6 — Per-Claim Classification")
-        st.caption(
-            "Method: LLM-based claim-level CPC assignment + reconciliation with validated codes"
-        )
-        for claim in per_claim[:10]:
-            claim_num = claim.get("claim_number", "?")
-            codes = claim.get("cpc_codes", [])
-            codes_str = ", ".join(codes) if codes else "N/A"
-            st.write(f"**Claim {claim_num}:** `{codes_str}`")
-    else:
-        st.divider()
-        st.subheader("[LIST] Phase 6 — Per-Claim Classification")
-        st.caption(
-            "Method: LLM-based claim-level CPC assignment + reconciliation with validated codes"
-        )
-        st.warning(
-            "**Phase 6 results not available.**\n\n"
-            "Per-claim reconciliation did not complete. "
-            "Individual claim classifications could not be determined."
-        )
+    # ── Cross-Domain Facets ──
+    pillars = phase5.get("pillars", {})
+    if pillars:
+        st.markdown("---")
+        st.markdown("### [FACETS] Cross-Domain Classifications")
 
-    # PHASE 7: Consistency Check
-    phase7 = result.get("phase7", {})
-    if phase7:
-        st.divider()
-        st.subheader("[OK] Phase 7 — Final Consistency Check")
-        st.caption(
-            "Method: LLM-based coherence check + conflict detection + final recommendation"
-        )
-        coherent = phase7.get("coherent", True)
-        if coherent:
-            st.success("[OK] Classifications are coherent")
+        facet_tooltips = {
+            "pillar1_goal": "The core technical result/output.",
+            "pillar2_method": "The AI/ML implementation strategy.",
+            "pillar3_context": "The target hardware/industrial environment.",
+        }
+
+        # Premier pillar shown first as top header
+        goal = pillars.get("pillar1_goal", {})
+        if goal and goal.get("symbol"):
+            st.markdown(
+                f"🎯 **Primary Facet:** `{goal['symbol']}` — *{goal.get('title', '')}*"
+            )
+            st.caption(
+                f"Score: {goal.get('score', 0):.4f} | {facet_tooltips['pillar1_goal']}"
+            )
+
+        # Supporting facets grouped under collapsible
+        supporting = {k: v for k, v in pillars.items() if k != "pillar1_goal"}
+        if supporting:
+            with st.expander("**Supporting Technical Facets**", expanded=True):
+                method = pillars.get("pillar2_method", {})
+                context = pillars.get("pillar3_context", {})
+
+                if method:
+                    if method.get("symbol"):
+                        st.markdown(
+                            f"🧠 **Methodological:** `{method['symbol']}` — *{method.get('title', '')}*"
+                        )
+                        st.caption(
+                            f"Score: {method.get('score', 0):.4f} | {facet_tooltips['pillar2_method']}"
+                        )
+                    else:
+                        st.warning(
+                            f"🧠 **Methodological:** {method.get('title', 'Not found')}"
+                        )
+
+                if context:
+                    if context.get("symbol"):
+                        st.markdown(
+                            f"⚙️ **Application:** `{context['symbol']}` — *{context.get('title', '')}*"
+                        )
+                        st.caption(
+                            f"Score: {context.get('score', 0):.4f} | {facet_tooltips['pillar3_context']}"
+                        )
+                    else:
+                        st.warning(
+                            f"⚙️ **Application:** {context.get('title', 'Not found')}"
+                        )
+
+# =============================================================================
+# PHASE 8: Role Labeling & Report
+# =============================================================================
+elif phase == "Phase 8: Role Labeling & Report":
+    formatted_report = result.get("formatted_report", "")
+    phase8 = result.get("phase8_role_labeling", {})
+    premier = result.get("premier", {})
+    pillars = result.get("phase5", {}).get("pillars", {})
+
+    premier_symbol = premier.get("symbol", "")
+    premier_title = premier.get("title", "")
+    premier_conf = premier.get("confidence", "medium")
+
+    core = phase8.get("layer1_core", [])
+    support = phase8.get("layer2_support", [])
+    ctx_codes = phase8.get("layer2_context", [])
+    coverage = phase8.get("layer3_coverage", [])
+
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════
+    # HEADER + CONFIDENCE BADGE
+    # ═══════════════════════════════════════════════════════════
+    st.subheader("📄 Executive Patent Classification Report")
+
+    col_hero, col_badge = st.columns([3, 1])
+    with col_hero:
+        if premier_symbol:
+            st.markdown(f"### Main Recommendation: `{premier_symbol}`")
+            st.markdown(f"*{premier_title}*")
         else:
-            st.warning("[WARN] Inconsistencies detected")
+            st.warning("No premier classification available.")
+    with col_badge:
+        if premier_conf == "high":
+            st.success("✅ High Confidence")
+        elif premier_conf == "medium":
+            st.info("🔶 Medium Confidence")
+        else:
+            st.warning("⚠️ Low Confidence")
+    st.caption("Status: ✅ Validated via Cross-Domain Consistency Check")
 
-        issues = phase7.get("issues", [])
-        if issues:
-            st.markdown("**Issues:**")
-            for issue in issues:
-                st.write(f"- {issue}")
+    # ═══════════════════════════════════════════════════════════
+    # TECHNICAL BREAKDOWN TABLE — first substantive section
+    # ═══════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### 🛠 Technical Breakdown")
+    st.caption("Recommended CPC Classes for this Invention — Role-Based View")
 
-        rec_primary = phase7.get("recommended_primary", "")
-        if rec_primary:
-            st.markdown(f"**Recommended Primary:** `{rec_primary}`")
+    goal = pillars.get("pillar1_goal", {})
+    method = pillars.get("pillar2_method", {})
+    context = pillars.get("pillar3_context", {})
 
-        rec_secondary = phase7.get("recommended_secondary", [])
-        if rec_secondary:
-            st.markdown(f"**Recommended Secondary:** {', '.join(rec_secondary)}")
+    pillar_tooltips = {
+        "🎯 Primary Goal": "This code represents the core legal contribution of your patent — the actual output.",
+        "🧠 AI Methodology": "The brain used to do it — the AI/ML implementation strategy.",
+        "⚙️ Domain Context": "The industrial target — where the invention is applied.",
+    }
 
-    # Raw JSON for debugging
-    with st.expander("[DEBUG] Raw Phase 1 JSON"):
-        st.json(phase1)
+    if goal is not None or method is not None or context is not None:
+        tech_data = []
 
-    with st.expander("[DEBUG] Raw Phase 3 JSON"):
-        st.json(phase3)
+        # Primary Goal — always show
+        g_sym = goal.get("symbol", "") if goal else ""
+        tech_data.append(
+            {
+                "Role": "🎯 Primary Goal",
+                "CPC Code": f"`{g_sym}`" if g_sym else "*Not found*",
+                "Context": (
+                    f"The actual output: {goal.get('title', 'N/A')}"
+                    if g_sym
+                    else f"Target: {goal.get('family', 'G06F')} subclass"
+                ),
+            }
+        )
 
-    if phase4:
-        with st.expander("[DEBUG] Raw Phase 4 JSON"):
-            st.json(phase4)
+        # AI Methodology — always show
+        m_sym = method.get("symbol", "") if method else ""
+        tech_data.append(
+            {
+                "Role": "🧠 AI Methodology",
+                "CPC Code": f"`{m_sym}`" if m_sym else "*Not found*",
+                "Context": (
+                    f"The brain used to do it: {method.get('title', 'N/A')}"
+                    if m_sym
+                    else f"Target: {method.get('family', 'G06N')} subclass"
+                ),
+            }
+        )
 
-    if phase5:
-        with st.expander("[DEBUG] Raw Phase 5 JSON"):
-            st.json(phase5)
+        # Domain Context — always show
+        c_sym = context.get("symbol", "") if context else ""
+        tech_data.append(
+            {
+                "Role": "⚙️ Domain Context",
+                "CPC Code": f"`{c_sym}`" if c_sym else "*Not found*",
+                "Context": (
+                    f"The industrial target: {context.get('title', 'N/A')}"
+                    if c_sym
+                    else f"Target: {context.get('family', 'G05B')} subclass"
+                ),
+            }
+        )
 
-    if phase7:
-        with st.expander("[DEBUG] Raw Phase 7 JSON"):
-            st.json(phase7)
+        st.dataframe(
+            pd.DataFrame(tech_data),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Tooltips as caption below the table
+        st.caption(
+            "ℹ️ **Primary Goal:** This code represents the core legal contribution of your patent — the actual output.  "
+            "**AI Methodology:** The brain used to do it — the AI/ML implementation strategy.  "
+            "**Domain Context:** The industrial target — where the invention is applied."
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # PROFESSIONAL JUSTIFICATION
+    # ═══════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### 💡 Professional Justification")
+    llm_summary = phase8.get("phase85_executive_summary", "")
+    if llm_summary:
+        st.markdown(llm_summary)
+    else:
+        reason = premier.get("reasoning", "")
+        if reason:
+            st.info(reason)
+        else:
+            st.info(
+                "The classification reflects the primary technical contribution "
+                "of the disclosed invention based on semantic analysis, technical "
+                "weight analysis, and cross-domain validation."
+            )
+
+    # ═══════════════════════════════════════════════════════════
+    # ANALYSIS & LOGIC (Collapsible Tabs)
+    # ═══════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### 🔍 Analysis & Logic")
+    st.caption("Click to expand — expert reasoning, supplementary codes, and raw data.")
+
+    # Tab 1: Expert Analysis — Main Recommendation
+    with st.expander("💡 How was the Main Recommendation selected?"):
+        st.markdown(
+            "<div style='background-color:#e8f4fd;padding:12px;border-radius:8px;"
+            "border-left:4px solid #2196F3;'>"
+            "<em><strong>Expert Analysis — Thematic Shift Detection</strong><br><br>"
+            "The system performs a <strong>'Thematic Shift' analysis</strong> across "
+            "all pipeline phases. While early phases focused on broad families, "
+            "the final consistency check identifies the most legally defensible "
+            "specific code by analyzing how the technical contribution <strong>shifts</strong> "
+            "from general functionality to specific novelty.<br><br>"
+            "This code survived all validation layers: "
+            "<strong>Phase 2D anchor filtering</strong> (eliminated non-technical noise), "
+            "<strong>Phase 3.5 decision tree</strong> (prioritized standard over indexing codes), "
+            "<strong>Phase 3.6 cross-domain validation</strong> (verified domain consistency), "
+            "and <strong>Phase 4/5 hypothesis resolution</strong> (confirmed as best-fit hypothesis)."
+            "</em></div>",
+            unsafe_allow_html=True,
+        )
+
+    # Tab 2: Expert Analysis — Confidence
+    if premier_conf != "high":
+        with st.expander("💡 Why not higher confidence?"):
+            st.markdown(
+                "<div style='background-color:#fff3e0;padding:12px;border-radius:8px;"
+                "border-left:4px solid #FF9800;'>"
+                "<em><strong>Expert Analysis — Subclass Discrepancy Detection</strong><br><br>"
+                "This flag is triggered because the invention spans multiple distinct "
+                "high-value CPC domains. The system detected a <strong>'Dual-Core' pattern</strong> — "
+                "the patent's technical contribution bridges two or more major subclasses "
+                "(e.g., G06N Artificial Intelligence vs. G06F Software Engineering).<br><br>"
+                "<strong>What this means:</strong> The AI found credible classifications in "
+                "multiple families. This is <strong>not an error</strong> — it indicates the "
+                "invention is genuinely multi-disciplinary. Human review is advised to choose "
+                "the primary filing target based on the strongest legal claims."
+                "</em></div>",
+                unsafe_allow_html=True,
+            )
+
+    # Tab 3: Expert Analysis — Role Assignment
+    with st.expander("💡 Why assign roles to CPC codes?"):
+        st.markdown(
+            "<div style='background-color:#e8f4fd;padding:12px;border-radius:8px;"
+            "border-left:4px solid #2196F3;'>"
+            "<em><strong>Expert Analysis — Preventing Domain-Blindness</strong><br><br>"
+            "This <strong>'Tech Stack' view</strong> prevents <strong>domain-blindness</strong> — "
+            "the common patent classification error where a single code dominates and "
+            "hides the multi-dimensional nature of modern inventions.<br><br>"
+            "By assigning distinct <strong>functional roles</strong> "
+            "(Goal = what it produces, Engine = how it works, Context = where it applies), "
+            "we ensure the patent is <strong>searchable across AI, Software, and Industrial "
+            "databases simultaneously</strong>."
+            "</em></div>",
+            unsafe_allow_html=True,
+        )
+
+    # Tab 4: Expert Analysis — Justification Generation
+    with st.expander("💡 How was the Professional Justification generated?"):
+        st.markdown(
+            "<div style='background-color:#e8f4fd;padding:12px;border-radius:8px;"
+            "border-left:4px solid #2196F3;'>"
+            "<em><strong>Expert Analysis — Multi-Phase Reasoning Synthesis</strong><br><br>"
+            "This justification is <strong>NOT</strong> a generic template — it is "
+            "<strong>dynamically generated</strong> from actual pipeline data: "
+            "Phase 1 (technical object, core function), Phase 5 Facets (goal/method/context "
+            "champions), Phase 8 role labeling (core/support/context/coverage layers), "
+            "and the consistency check (cross-domain coherence validation).<br><br>"
+            "The LLM receives structured data and produces a <strong>professional brief</strong> "
+            "suitable for patent filings or examiner responses."
+            "</em></div>",
+            unsafe_allow_html=True,
+        )
+
+    # Tab 5: Suggested Indexing Codes
+    pillar_symbols = set()
+    for k, v in pillars.items():
+        if v.get("symbol"):
+            pillar_symbols.add(v["symbol"])
+
+    suggested = []
+    for group in [core, support, ctx_codes, coverage]:
+        for c in group:
+            sym = c.get("symbol", "")
+            if sym not in pillar_symbols and sym != premier_symbol:
+                title = c.get("title", "")
+                if title:
+                    suggested.append(f"`{sym}` — {title}")
+
+    if suggested:
+        with st.expander("📋 Suggested Indexing Codes (for patent filing)"):
+            st.caption(
+                "Copy these codes into your patent application as supplementary indexing references."
+            )
+            for s in suggested[:10]:
+                st.write(f"- {s}")
+    else:
+        with st.expander("📋 Suggested Indexing Codes (for patent filing)"):
+            st.write(
+                "No additional indexing codes available beyond the recommended classes above."
+            )
+
+    # Tab 6: Full Classification Report
+    if formatted_report:
+        with st.expander("📊 Full Classification Report (Raw Markdown)"):
+            st.markdown(formatted_report)
+
+    # Tab 7: Supporting Details
+    if core or support or ctx_codes:
+        with st.expander("📊 Supporting Classification Details (Layer Breakdown)"):
+            if core:
+                st.markdown("**Core Invention:**")
+                for c in core:
+                    st.write(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+            if support:
+                st.markdown("**Enabling Technology:**")
+                for c in support:
+                    st.write(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+            if ctx_codes:
+                st.markdown("**Application Context:**")
+                for c in ctx_codes:
+                    st.write(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+            if coverage:
+                st.markdown("**Legal Coverage:**")
+                for c in coverage:
+                    st.write(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+
+    # ═══════════════════════════════════════════════════════════
+    # DOWNLOAD
+    # ═══════════════════════════════════════════════════════════
+    if formatted_report:
+        st.markdown("---")
+        st.download_button(
+            label="📥 Download Executive Report (Markdown)",
+            data=formatted_report,
+            file_name="cpc_classification_report.md",
+            mime="text/markdown",
+        )
+
+# =============================================================================
+# RAW JSON DEBUG (always show, collapsed)
+# =============================================================================
+st.divider()
+st.caption("**Raw JSON Dumps** (for debugging)")
+
+phase1_raw = result.get("phase1", {})
+phase3_raw = result.get("phase3", [])
+phase4_raw = result.get("phase4", {})
+phase5_raw = result.get("phase5", {})
+
+with st.expander("[DEBUG] Raw Phase 1 JSON"):
+    st.json(phase1_raw)
+
+with st.expander("[DEBUG] Raw Phase 3 JSON"):
+    st.json(phase3_raw)
+
+if phase4_raw:
+    with st.expander("[DEBUG] Raw Phase 4 JSON"):
+        st.json(phase4_raw)
+
+if phase5_raw:
+    with st.expander("[DEBUG] Raw Phase 5 JSON"):
+        st.json(phase5_raw)

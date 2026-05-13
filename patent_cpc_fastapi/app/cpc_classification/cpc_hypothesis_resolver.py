@@ -161,10 +161,11 @@ class CPCHypothesisResolver:
 
         # ─────────────────────────────────────────────────────────────
         # Step 6: Tri-Pillar Resolution — back-scan raw candidates for
-        #         highest-scoring champion per functional role
+        #         highest-scoring champion per functional role.
+        #         Always run even if pool is empty (shows fallback targets).
         # ─────────────────────────────────────────────────────────────
-        if all_raw_candidates:
-            result["pillars"] = self._resolve_pillars(all_raw_candidates, phase1_data)
+        raw_pool = all_raw_candidates if all_raw_candidates is not None else []
+        result["pillars"] = self._resolve_pillars(raw_pool, phase1_data)
 
         return result
 
@@ -183,6 +184,12 @@ class CPCHypothesisResolver:
         Falls back to the ranked candidates from Phase 3 if no raw candidate found.
         """
         pillars = {}
+
+        logger.info(
+            "Phase 5 Tri-Pillar: Pool size=%d, first 3 symbols=%s",
+            len(all_raw_candidates),
+            [c.get("symbol", "")[:12] for c in all_raw_candidates[:3]],
+        )
 
         for pillar_key, pillar_def in PILLAR_DEFINITIONS.items():
             families = pillar_def["families"]

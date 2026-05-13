@@ -1,2 +1,0 @@
-npm run dev            → run project (server)
-npx ts-node  file.ts   → run one file (manual)
