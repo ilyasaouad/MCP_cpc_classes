@@ -9,6 +9,18 @@ logger = logging.getLogger(__name__)
 def run_phase3(classifier, candidates, phase1, layer_result, tcr_result):
     ranked = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:20]
 
+    # Phase 3.5 always runs — it handles domain disambiguation, functional boosting,
+    # hierarchy priority, and invalid-class filtering across all patent fields.
+    # Especially valuable for ambiguous cross-domain patents (e.g. mechanical+software,
+    # medical+computing, automotive+AI) where Phase 2C scoring alone can drift.
+    #
+    # Could be skipped when:
+    #   - All top-5 candidates share the same 4-char CPC family (single-domain dominance)
+    #   - Phase 2A domain confidence >= 0.85 (already unambiguous)
+    #   - Example: a pure G10L speech patent where Phase 2C already ranked correctly.
+    # To add the short-circuit:
+    #   top_families = {c.get("symbol","")[:4] for c in ranked[:5]}
+    #   if len(top_families) == 1 and phase2a_confidence >= 0.85: skip
     phase35_result = {}
     try:
         dt_constraint = CPCDecisionTreeConstraint()

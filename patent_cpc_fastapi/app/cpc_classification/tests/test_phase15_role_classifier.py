@@ -106,6 +106,7 @@ class TestCPCRoleClassifier:
 
         assert result["role"] == "SYSTEM"
         assert result["confidence"] == 0.5
+        assert len(result) == 2  # only role + confidence
 
     def test_format_terms(self, classifier):
         """Test term formatting for prompt."""

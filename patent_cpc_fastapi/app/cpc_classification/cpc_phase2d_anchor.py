@@ -1,17 +1,14 @@
 """
-Phase 2D — Subclass Structural Anchor
+Phase 2D — Top-N Score Filter
 
-Filters Phase 2C candidates to eliminate semantic drift into non-technical or
-irrelevant domains (like G06Q or generic application classes).
+Filters Phase 2C candidates by score, keeping only the top N highest-scoring
+subgroups for Phase 3 ranking. Eliminates low-confidence candidates that would
+dilute Phase 3's ranking quality.
 
 Strategy:
-    1. Extract an "Anchor Set" of 4-character CPC subclasses from Phase 2A
-       technical layers (pure_software, data_reasoning, interaction, control).
-       Strictly exclude the application layer and any 3-digit broad classes.
-    2. For each Phase 2C candidate: keep only if its 4-char prefix is in the
-       anchor set; discard otherwise.
-    3. Maintain the hybrid score (0.4×TF-IDF + 0.6×Semantic) from Phase 2C.
-    4. Output a purified candidate list (top 20) for Phase 3 ranking.
+    1. Sort all Phase 2C candidates by hybrid score (descending).
+    2. Keep top N (default 50) — discard the rest.
+    3. Provides clean, focused input to Phase 3 with reduced noise.
 """
 
 import logging
@@ -120,104 +117,57 @@ class Phase2DSubclassAnchor:
         max_result: int = 50,
     ) -> Dict[str, Any]:
         """
-        Filter Phase 2C candidates using the subclass anchor from Phase 2A.
+        Top-N score filter: keep the highest-scoring Phase 2C candidates.
 
         Args:
             candidates: Phase 2C candidates (list of dicts with 'symbol', 'score', ...)
-            layer_result: Phase 2A layer decomposition output
-            max_result: Maximum number of candidates to process from Phase 2C
+            layer_result: Unused — kept for API compatibility with the runner.
+            max_result: Number of top candidates to keep (default 50).
 
         Returns:
             Dict with:
-                - purified_candidates: Filtered list (top 20)
-                - anchor_set: The 4-char subclasses used as anchors
-                - anchor_source: Which layers contributed anchors
+                - purified_candidates: Top-N candidates sorted by score
                 - kept_count / discarded_count: Statistics
-                - discard_log: List of discarded candidates with reasons
+                - discard_log: Symbols that were cut
+                - anchor_set / anchor_source: Empty (legacy fields, kept for compatibility)
         """
-        input_count = len(candidates)
-        limited_candidates = candidates[:max_result]
-
-        # Step 1: Build anchor set
-        anchor_set, anchor_source = self._build_anchor_set(layer_result)
-        logger.info(
-            "Phase 2D: Built anchor set with %d subclasses from layers: %s",
-            len(anchor_set),
-            ", ".join(sorted(anchor_source)),
-        )
-
-        if not anchor_set:
-            logger.warning(
-                "Phase 2D: No anchors found — passing all %d candidates through unchanged",
-                input_count,
-            )
+        if not candidates:
             return {
-                "purified_candidates": sorted(
-                    limited_candidates,
-                    key=lambda x: x.get("score", 0),
-                    reverse=True,
-                )[:20],
-                "anchor_set": list(anchor_set),
-                "anchor_source": list(anchor_source),
-                "kept_count": len(limited_candidates),
+                "purified_candidates": [],
+                "anchor_set": [],
+                "anchor_source": ["score_filter"],
+                "kept_count": 0,
                 "discarded_count": 0,
                 "discard_log": [],
             }
 
-        # Step 2: Filter candidates
-        kept = []
-        discarded = []
-        discard_log = []
+        sorted_candidates = sorted(
+            candidates, key=lambda x: x.get("score", 0), reverse=True
+        )
 
-        for c in limited_candidates:
-            symbol = c.get("symbol", "")
-            prefix = self._extract_subclass_prefix(symbol)
+        kept = sorted_candidates[:max_result]
+        discarded = sorted_candidates[max_result:]
 
-            if prefix is None:
-                discarded.append(c)
-                discard_log.append(
-                    {
-                        "symbol": symbol,
-                        "reason": "no_4char_prefix",
-                    }
-                )
-                continue
-
-            if prefix in anchor_set and prefix not in self.excluded_families:
-                kept.append(c)
-            else:
-                discarded.append(c)
-                reason = (
-                    "non_technical_family"
-                    if prefix in self.excluded_families
-                    else "not_in_anchor_set"
-                )
-                discard_log.append(
-                    {
-                        "symbol": symbol,
-                        "prefix": prefix,
-                        "reason": reason,
-                    }
-                )
-
-        # Step 3: Sort kept by hybrid score descending, return top 20
-        kept.sort(key=lambda x: x.get("score", 0), reverse=True)
-        purified = kept[:20]
+        discard_log = [
+            {"symbol": c.get("symbol", ""), "reason": "below_top_n_threshold"}
+            for c in discarded
+        ]
 
         logger.info(
-            "Phase 2D: Input=%d → Kept=%d (top-20=%d) → Discarded=%d. "
-            "Anchor subclasses: %s",
-            len(limited_candidates),
+            "Phase 2D: Top-%d filter — Input=%d → Kept=%d → Discarded=%d "
+            "(score range: %.4f – %.4f)",
+            max_result,
+            len(candidates),
             len(kept),
-            len(purified),
             len(discarded),
-            ", ".join(sorted(anchor_set)),
+            kept[-1].get("score", 0) if kept else 0,
+            kept[0].get("score", 0) if kept else 0,
         )
 
         return {
-            "purified_candidates": purified,
-            "anchor_set": sorted(anchor_set),
-            "anchor_source": sorted(anchor_source),
+            "purified_candidates": kept,
+            "anchor_set": [],
+            "anchor_source": ["score_filter"],
             "kept_count": len(kept),
             "discarded_count": len(discarded),
             "discard_log": discard_log,

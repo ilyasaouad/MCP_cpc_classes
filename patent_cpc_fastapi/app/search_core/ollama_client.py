@@ -31,7 +31,7 @@ class OllamaClient:
         self,
         model_name: str = "gpt-oss:120b-cloud",
         base_url: str = "http://localhost:11434",
-        timeout: int = 180,
+        timeout: int = 600,  # 10 min — Phase 1 runs 5 serial LLM passes with 120B model
     ):
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")

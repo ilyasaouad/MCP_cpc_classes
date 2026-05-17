@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Tri-Pillar Definitions
 # ─────────────────────────────────────────────────────────────────────
 
-PILLAR_DEFINITIONS = {
+_DEFAULT_PILLAR_DEFINITIONS = {
     "pillar1_goal": {
         "label": "Primary Facet (Core Purpose)",
         "description": "The core technical result/output — what the invention PRODUCES.",
@@ -37,11 +37,61 @@ PILLAR_DEFINITIONS = {
     },
     "pillar3_context": {
         "label": "Application Facet (Domain)",
-        "description": "The target hardware/industrial environment — where the invention APPLIES.",
+        "description": "The secondary domain — where the invention APPLIES.",
         "families": ["G05B", "B60W", "A61B", "H02J"],
         "fallback_family": "G05B",
     },
 }
+
+
+def _build_pillar_definitions(phase2a_families: List[str]) -> Dict[str, Any]:
+    """
+    Build Tri-Pillar definitions dynamically from Phase 2A selected families.
+
+    pillar1_goal  → primary Phase 2A family (highest relevance)
+    pillar2_method → G06N always (ML/AI methodology), or primary if G06N absent
+    pillar3_context → remaining Phase 2A families (secondary domain)
+    """
+    if not phase2a_families:
+        return dict(_DEFAULT_PILLAR_DEFINITIONS)
+
+    METHOD_FAMILY = "G06N"
+    primary = phase2a_families[0]
+    others = [f for f in phase2a_families[1:] if f != METHOD_FAMILY]
+
+    # pillar1: primary domain family
+    p1_families = [primary] if primary != METHOD_FAMILY else phase2a_families[:1]
+
+    # pillar2: always G06N if present, else first family
+    p2_families = [METHOD_FAMILY] if METHOD_FAMILY in phase2a_families else [primary]
+
+    # pillar3: remaining families (exclude primary and method)
+    p3_families = others if others else [f for f in phase2a_families if f not in p1_families + p2_families]
+
+    return {
+        "pillar1_goal": {
+            "label": "Primary Facet (Core Purpose)",
+            "description": "The core technical result/output — what the invention PRODUCES.",
+            "families": p1_families,
+            "fallback_family": p1_families[0],
+        },
+        "pillar2_method": {
+            "label": "Methodological Facet (Implementation)",
+            "description": "The AI/ML implementation strategy — how the invention WORKS.",
+            "families": p2_families,
+            "fallback_family": p2_families[0],
+        },
+        "pillar3_context": {
+            "label": "Application Facet (Domain)",
+            "description": "The secondary domain — where the invention APPLIES.",
+            "families": p3_families if p3_families else p1_families,
+            "fallback_family": p3_families[0] if p3_families else p1_families[0],
+        },
+    }
+
+
+# Keep PILLAR_DEFINITIONS as module-level alias for backwards compatibility
+PILLAR_DEFINITIONS = _DEFAULT_PILLAR_DEFINITIONS
 
 
 class CPCHypothesisResolver:
@@ -165,7 +215,8 @@ class CPCHypothesisResolver:
         #         Always run even if pool is empty (shows fallback targets).
         # ─────────────────────────────────────────────────────────────
         raw_pool = all_raw_candidates if all_raw_candidates is not None else []
-        result["pillars"] = self._resolve_pillars(raw_pool, phase1_data)
+        phase2a_families = phase1_data.get("phase2a_families", [])
+        result["pillars"] = self._resolve_pillars(raw_pool, phase1_data, phase2a_families)
 
         return result
 
@@ -173,6 +224,7 @@ class CPCHypothesisResolver:
         self,
         all_raw_candidates: List[Dict[str, Any]],
         phase1_data: Dict[str, Any],
+        phase2a_families: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Find the highest-scoring CPC champion for each of the three pillars.
@@ -184,14 +236,16 @@ class CPCHypothesisResolver:
         Falls back to the ranked candidates from Phase 3 if no raw candidate found.
         """
         pillars = {}
+        pillar_defs = _build_pillar_definitions(phase2a_families or [])
 
         logger.info(
-            "Phase 5 Tri-Pillar: Pool size=%d, first 3 symbols=%s",
+            "Phase 5 Tri-Pillar: Pool size=%d, first 3 symbols=%s, phase2a_families=%s",
             len(all_raw_candidates),
             [c.get("symbol", "")[:12] for c in all_raw_candidates[:3]],
+            phase2a_families,
         )
 
-        for pillar_key, pillar_def in PILLAR_DEFINITIONS.items():
+        for pillar_key, pillar_def in pillar_defs.items():
             families = pillar_def["families"]
             label = pillar_def["label"]
             desc = pillar_def["description"]

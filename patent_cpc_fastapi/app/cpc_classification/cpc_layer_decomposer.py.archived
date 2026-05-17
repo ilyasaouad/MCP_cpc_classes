@@ -35,7 +35,6 @@ LAYER_DEFINITIONS = {
         "name": "Application Layer",
         "description": "What the system is FOR - the domain/purpose",
         "keywords": [
-            # DOMAIN-SPECIFIC keywords (not generic computing)
             "vehicle",
             "driving",
             "automotive",
@@ -57,26 +56,6 @@ LAYER_DEFINITIONS = {
             "financial",
             "banking",
             "trading",
-            # REMOVED: "simulation", "program", "code" - these are too generic for software inventions
-            # REMOVED: "machine" (ambiguous - could be ML or mechanical)
-        ],
-        "cpc_families": ["B60", "A61", "A01", "B23", "E21", "G06Q", "H02"],
-        "cpc_patterns": [
-            "B60W",
-            "B60R",
-            "B60L",
-            "B60T",
-            "B60N",
-            "A61B",
-            "A61C",
-            "A61F",
-            "A61H",
-            "A61J",
-            "A01B",
-            "A01C",
-            "A01D",
-            "A01G",
-            "A01K",
         ],
     },
     "pure_software": {
@@ -134,20 +113,10 @@ LAYER_DEFINITIONS = {
             "schema",
             "triple",
         ],
-        "cpc_families": ["G06F16", "G06F18", "G06F40", "G06F19"],
-        "cpc_patterns": [
-            "G06F16/9038",
-            "G06F16/9021",
-            "G06F16/9031",  # DB operations
-            "G06F40/30",
-            "G06F40/35",  # Query processing
-            "G06F18/24",
-            "G06F18/2431",  # Graph operations
-        ],
     },
     "interaction": {
         "name": "Interaction Layer",
-        "description": "User/system interaction - speech, NLP, display",
+        "description": "User/system interaction — speech, NLP, display",
         "keywords": [
             "speech",
             "voice",
@@ -170,20 +139,9 @@ LAYER_DEFINITIONS = {
             "visualization",
             "user interface",
         ],
-        "cpc_families": ["G10L", "G06F40", "G06N", "G06K"],
-        "cpc_patterns": [
-            "G10L15/22",
-            "G10L17/22",
-            "G10L21/10",  # Speech
-            "G06F40/30",
-            "G06F40/35",
-            "G06F40/40",  # NLP/text
-            "G06N3/08",
-            "G06N3/04",  # Neural networks (secondary)
-        ],
     },
     "control": {
-        "name": "Control Orchestration Layer",
+        "name": "Control & Orchestration Layer",
         "description": "System logic, scheduling, coordination, workflow",
         "keywords": [
             "control",
@@ -197,23 +155,11 @@ LAYER_DEFINITIONS = {
             "automation",
             "feedback",
             "event handling",
-            "dispatching",
-            "routing",
-            "state",
-            "mode",
-            "phase",
-            "sequence",
-            "multi-component",
-            "multi-system",
-            "interaction",
-        ],
-        "cpc_families": ["G05B", "G05D", "G05B19"],
-        "cpc_patterns": [
-            "G05B13/027",
-            "G05B15/00",
-            "G05B19/047",
-            "G05D1/02",
-            "G05D1/00",  # Vehicle control
+            "trigger",
+            "response",
+            "action",
+            "decision",
+            "rule engine",
         ],
     },
 }
@@ -247,13 +193,11 @@ AI_ROLE_CONFIG = {
         "description": "AI used for speech, vision, NLP support",
         "weight": 0.5,
         "layers": ["interaction", "data_reasoning"],
-        "cpc_families": ["G10L", "G06F40", "G06K"],
     },
     "as_core_method": {
         "description": "Invention modifies model behavior itself",
         "weight": 1.5,
         "layers": ["data_reasoning"],
-        "cpc_families": ["G06N3", "G06N20", "G06T3"],
         "strong_signals": [
             "weight clipping",
             "weight quantization",
@@ -368,140 +312,65 @@ class CPCLayerDecomposer:
         tcr_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Decompose patent into technical layers with independent CPC mapping.
+        Decompose patent into technical layers — EXPLANATORY ONLY.
 
-        Args:
-            phase1_data: Output from Phase 1
-            phase15_data: Optional output from Phase 1.5 (invention role)
-            tcr_result: Optional Technical Weight Analysis result
-                        When TCR > 2.0 (FORCE_SOFTWARE_CORE), pure_software layer
-                        is prioritized, application layer CPCs are deprioritized.
-
-        Returns:
-            Dict with:
-                - layers: Dict of layer_name -> list of CPC candidates
-                - primary_layer: The most important layer
-                - layer_scores: Per-layer confidence scores
-                - relationships: Layer relationship graph
-                - reasoning: Explanation
+        Does NOT produce CPC families, patterns, scores, or classification.
+        Outputs structural decomposition with natural language descriptions.
         """
-        # Extract text for analysis
         technical_object = phase1_data.get("technical_object", "").lower()
         core_function = phase1_data.get("core_function", "").lower()
         system_context = phase1_data.get("system_context", "").lower()
-        strategy = phase1_data.get("classification_strategy", "").lower()
 
         terms = phase1_data.get("terms", phase1_data.get("essential_terms", []))
         domain_signals = phase1_data.get("domain_signals", [])
 
         combined_text = f"{technical_object} {core_function} {system_context}"
         all_terms_text = " ".join(
-            [
-                t.get("term", "").lower() if isinstance(t, dict) else str(t).lower()
-                for t in terms
-            ]
+            t.get("term", "").lower() if isinstance(t, dict) else str(t).lower()
+            for t in terms
         )
 
-        # Detect AI role (tool vs core method)
         ai_role = self._detect_ai_role(all_terms_text, phase15_data)
 
-        # Score each layer independently
         layer_scores = {}
-        layer_candidates = {}
-        layer_signals = {}
+        layer_concepts = {}
 
         for layer_name, layer_config in LAYER_DEFINITIONS.items():
-            # Score this layer independently
             score, signals = self._score_layer(
                 combined_text + " " + all_terms_text,
                 layer_config,
                 domain_signals,
                 ai_role,
             )
-
             layer_scores[layer_name] = score
-            layer_signals[layer_name] = signals
-
-            # Get CPC candidates for this layer
-            candidates = self._get_layer_candidates(
-                layer_config,
-                signals,
-                ai_role,
-                layer_name,
-            )
-            layer_candidates[layer_name] = candidates
-
+            layer_concepts[layer_name] = {
+                "name": layer_config["name"],
+                "description": layer_config["description"],
+                "matched_concepts": list(signals)[:10],
+                "relevance_score": round(score, 3),
+            }
             logger.info(
-                "Layer %s: score=%.3f, candidates=%d",
+                "Layer %s (explanatory): score=%.3f, concepts=%s",
                 layer_name,
                 score,
-                len(candidates),
+                list(signals)[:5],
             )
 
-        # ── MANDATORY DOMAIN ANCHOR CHECK (Prompt 1) ──
-        # If Phase 1 identifies high-confidence primary domain,
-        # ensure at least one associated CPC family is prioritized
-        layer_scores, anchor_log = self._apply_mandatory_domain_anchor(
-            layer_scores, layer_candidates, phase1_data
-        )
-        if anchor_log:
-            logger.info("Domain Anchor: %s", anchor_log)
-
-        # ── AI + AUTOMOTIVE CO-OCCURRENCE RULES (Prompt 1) ──
-        # When both AI and Automotive keywords present,
-        # boost software layers, demote hardware layers
-        layer_scores = self._apply_ai_automotive_rules(
-            layer_scores, all_terms_text, phase15_data
-        )
-
-        # ── TCR-BASED SOFTWARE PRIORITIZATION (NEW) ──
-        # When TCR indicates pure software invention, boost pure_software layer
-        # and filter out application-layer domain noise
-        if tcr_result:
-            force_flag = tcr_result.get("force_flag", "")
-            tcr = tcr_result.get("tcr", 1.0)
-
-            if force_flag == "FORCE_SOFTWARE_CORE":
-                logger.info(
-                    "Layer Decomposer: TCR=FORCE_SOFTWARE_CORE (%.2f). Boosting pure_software, filtering application.",
-                    tcr,
-                )
-
-                # Boost pure_software layer
-                if "pure_software" in layer_scores:
-                    layer_scores["pure_software"] = max(
-                        layer_scores["pure_software"], 0.8
-                    )
-
-                # Demote application layer (it's noise for pure software)
-                if "application" in layer_scores and layer_scores["application"] < 0.5:
-                    layer_scores["application"] = 0.0
-                    # Clear application layer candidates too
-                    if "application" in layer_candidates:
-                        layer_candidates["application"] = []
-                    logger.info(
-                        "Layer Decomposer: application layer demoted to 0 (pure software detected)",
-                    )
-
-        # Determine primary layer (highest scoring with minimum confidence)
         primary_layer = self._determine_primary_layer(layer_scores)
-
-        # Build relationships
-        relationships = self._build_relationships(layer_scores)
-
-        # Build reasoning
-        reasoning = self._build_reasoning(
-            layer_scores, layer_candidates, primary_layer, ai_role
+        reasoning = "\n".join(
+            f"{layer_concepts[ln]['name']} (score={layer_scores[ln]:.2f}): "
+            f"{layer_concepts[ln]['description']}"
+            for ln in sorted(layer_scores, key=lambda k: -layer_scores[k])
         )
 
         return {
-            "layers": layer_candidates,
+            "layers": layer_concepts,
             "layer_scores": layer_scores,
             "primary_layer": primary_layer,
-            "relationships": relationships,
             "ai_role": ai_role,
             "reasoning": reasoning,
             "source": "layer_decomposition",
+            "is_cpc_authoritative": False,
         }
 
     def _detect_ai_role(
@@ -839,39 +708,17 @@ def merge_layers_to_family_list(
 
     Used by downstream phases that expect family list format.
 
-    Args:
-        layer_result: Layer decomposition result
-        tcr_result: Optional TCR analysis for filtering application layer CPCs
-                    When TCR > 2.0 (FORCE_SOFTWARE_CORE), application layer CPCs
-                    from A01, B23, F16, etc. are filtered out as irrelevant noise.
+    NO filtering based on TCR — keeps full CPC search space.
     """
     layers = layer_result.get("layers", {})
     family_list = []
     seen = set()
-
-    force_flag = None
-    if tcr_result:
-        force_flag = tcr_result.get("force_flag")
-
-    software_domains = {"G06F", "G06N", "G06K", "G06Q", "G10L", "G06V", "G05B"}
-    irrelevant_domains = {"A01", "B23", "F16", "C08", "E21", "H02"}
 
     for layer_name, candidates in layers.items():
         for cand in candidates:
             sym = cand.get("symbol", "")
             if not sym:
                 continue
-
-            # Filter application layer CPCs when TCR indicates pure software
-            if force_flag == "FORCE_SOFTWARE_CORE" and layer_name == "application":
-                # Skip non-software domains in application layer for software inventions
-                prefix_3 = sym[:3] if len(sym) >= 3 else sym
-                if prefix_3 in irrelevant_domains:
-                    logger.info(
-                        "merge_layers_to_family_list: SKIPPED %s from application layer (TCR=FORCE_SOFTWARE_CORE)",
-                        sym,
-                    )
-                    continue
 
             if sym not in seen:
                 seen.add(sym)

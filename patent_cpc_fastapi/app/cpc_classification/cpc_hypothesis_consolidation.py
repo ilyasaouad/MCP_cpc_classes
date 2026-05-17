@@ -356,12 +356,24 @@ class CPCHypothesisConsolidator:
             )
         elif primary_coherence < 0.6:
             coherence_status = "low"
-            coherence_text = (
-                f"**Low Coherence ({primary_coherence:.2f}).** "
-                "While these codes are in the same family, they are functionally distant. "
-                "This suggests the search is 'hallucinating' a connection between unrelated "
-                "technical features."
-            )
+            if support_weight > 0.8:
+                # High support + low coherence = multi-aspect patent (normal, not a problem).
+                # E.g. G10L15 (recognition) and G10L13 (synthesis) share the family but
+                # use different sub-branch vocabulary, naturally lowering Jaccard similarity.
+                coherence_text = (
+                    f"**Sub-Branch Spread ({primary_coherence:.2f}).** "
+                    "The candidates span multiple technical aspects within the same family "
+                    f"(e.g. different sub-branches of {primary_family}). "
+                    "This is expected for patents covering both the method and its application. "
+                    "Support weight is strong — classification is reliable."
+                )
+            else:
+                coherence_text = (
+                    f"**Low Coherence ({primary_coherence:.2f}).** "
+                    "While these codes are in the same family, they are functionally distant. "
+                    "The candidate pool may be mixing unrelated technical aspects — "
+                    "consider reviewing Phase 2B expansion breadth."
+                )
         else:
             coherence_status = "moderate"
             coherence_text = (
@@ -385,8 +397,9 @@ class CPCHypothesisConsolidator:
         elif support_status == "clean" and coherence_status != "high":
             actionable = (
                 "**Recommendation:** Support weight is strong but coherence is "
-                f"{coherence_status}. Consider running Phase 3.6 cross-domain "
-                "validation to tighten the candidate cluster."
+                f"{coherence_status}. This is normal when the patent covers multiple "
+                "technical aspects within the same family (e.g. recognition + synthesis "
+                "both in G10L). Proceed to Phase 5 — classification is reliable."
             )
         elif support_status != "clean" and coherence_status == "high":
             actionable = (

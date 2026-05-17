@@ -931,57 +931,44 @@ class CPCFamilyRouter:
     def _select_families(
         self, scores: Dict[str, float], phase1_data: Dict[str, Any], source: str
     ) -> Dict[str, Any]:
-        """Select top families from scores with proper reasoning."""
-        strategy = phase1_data.get("classification_strategy", "")
+        """
+        Select top families from scores with evidence-based reasoning.
 
-        # Sort by score
+        No legacy fallback. If scores are empty, returns empty families
+        with zero confidence — the caller must handle or retry.
+        """
+        strategy = phase1_data.get("classification_strategy", "unknown")
+
         sorted_families = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         if not sorted_families:
-            # Fallback
-            families = FALLBACK_FAMILIES[: self.max_families]
-            primary = families[0] if families else "G06"
+            logger.error(
+                "Phase 2A: No CPC families scored from %s — "
+                "returning empty. Pipeline should retry or report error.",
+                source,
+            )
             return {
-                "families": families,
-                "primary": primary,
-                "secondary": families[1:] if len(families) > 1 else [],
-                "reasoning": "Fallback families - no strong domain signals detected",
+                "families": [],
+                "primary": "",
+                "secondary": [],
+                "reasoning": "No CPC family candidates produced. Source was empty or weak.",
                 "scores": {},
-                "source": "fallback",
-                "modality": "unknown",
+                "source": source,
+                "modality": self._detect_modality(phase1_data),
             }
 
-        # Select top families
         top_families = [family for family, _ in sorted_families[: self.max_families]]
         primary = top_families[0]
         secondary = top_families[1:] if len(top_families) > 1 else []
 
-        # Ensure minimum diversity
-        if len(top_families) < 2:
-            if "system-first" in strategy.lower():
-                extras = ["B60", "A61", "F16"]
-            elif "function-first" in strategy.lower():
-                extras = ["G06F", "H04", "G01"]
-            else:
-                extras = FALLBACK_FAMILIES
-
-            for extra in extras:
-                if extra not in top_families:
-                    top_families.append(extra)
-                    secondary.append(extra)
-                if len(top_families) >= 2:
-                    break
-
-        # Detect modality for reasoning
         modality = self._detect_modality(phase1_data)
 
-        # Build reasoning
         top_scores_str = ", ".join([f"{f}={s:.2f}" for f, s in sorted_families[:3]])
         reasoning = (
             f"Primary modality: {modality}. "
             f"Top families: {top_scores_str}. "
-            f"Primary={primary} (purpose), secondary={secondary} (support/tool). "
-            f"Strategy={strategy}."
+            f"Primary={primary}, secondary={secondary}. "
+            f"Source={source}, strategy={strategy}."
         )
 
         logger.info("Phase 2A: %s", reasoning)

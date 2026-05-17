@@ -118,15 +118,18 @@ app.post("/mcp", async (req: Request, res: Response) => {
 // ─────────────────────────────────────────────
 app.post("/cpc/classify", async (req: Request, res: Response) => {
   try {
-    const { text } = req.body;
+    const { text, claims } = req.body;  // Forward claims too, not just text
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 minutes
 
+    const payload: Record<string, string> = { text };
+    if (claims) payload.claims = claims;  // Only include if provided
+
     const response = await fetch("http://localhost:8000/classify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
 

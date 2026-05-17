@@ -1,16 +1,16 @@
 import logging
-import os
 import re
 import math
 from collections import Counter
+from typing import Dict
 
-from ..scoring.tfidf_scorer import tokenize_with_bigrams, make_term_bigrams
-from ..scoring.semantic_scorer import compute_semantic_scores
+from ..scoring.tfidf_scorer import score_candidates
+from ..scoring.semantic_scorer import compute_semantic_scores, compute_rrf_fusion
 from ..scoring.domain_booster import get_synonyms, get_expanded_terms
-from ..utils.xml_utils import resolve_xml_dir
 from ..utils.text_utils import normalize_word
 from ..cpc_phase2d_anchor import Phase2DSubclassAnchor
-from ..cpc_layer_decomposer import merge_layers_to_family_list
+from .phase_2a_v2 import Phase2AV2Router
+from .phase2b_expander import Phase2BExpander
 
 logger = logging.getLogger(__name__)
 
@@ -50,168 +50,147 @@ def run_phase2(classifier, phase1, phase15_result=None, tcr_result=None):
 
     system_context = phase1.get("system_context", "").lower()
     core_function = phase1.get("core_function", "").lower()
-    strategy = phase1.get("classification_strategy", "").lower()
+    # Extract strategy from either object (new) or string (old) format
+    strat_obj = phase1.get("classification_strategy", "")
+    if isinstance(strat_obj, dict):
+        strategy = strat_obj.get("strategy", "").lower()
+    else:
+        strategy = str(strat_obj).lower()
 
-    # ─────────────────────────────
-    # PHASE 2A: CPC Layer Decomposition
-    # ─────────────────────────────
-    phase2a_result = classifier.layer_decomposer.decompose(
-        phase1, phase15_result, tcr_result
-    )
+    # ── Phase 2A-Layer: Hardcoded fallback (LLM decomposer removed) ──
+    # Phase 2D depends on the layer structure for anchor filtering,
+    # so we provide a static layer definition instead of calling LLM.
+    # layers={} forces Phase 2D to use family-router fallback which
+    # reads phase2a_families (injected after Phase 2A v2 runs below).
+    layer_result = {
+        "primary_layer": "data_reasoning",
+        "ai_role": "core_method",
+        "layer_scores": {
+            "application": 0.5,
+            "pure_software": 0.3,
+            "data_reasoning": 0.7,
+            "interaction": 0.4,
+            "control": 0.2,
+        },
+        "layers": {},
+        "decomposition_mode": "hardcoded_fallback",
+    }
 
-    layer_result = phase2a_result
     layers = layer_result.get("layers", {})
-    primary_layer = layer_result.get("primary_layer", "application")
+    primary_layer = layer_result.get("primary_layer", "unknown")
     layer_scores = layer_result.get("layer_scores", {})
-    layer_reasoning = layer_result.get("reasoning", "")
-
-    top_cpc_families = merge_layers_to_family_list(layer_result, tcr_result)
-    phase2a_reasoning = layer_reasoning
-    phase2a_source = "layer_decomposition"
+    layer_explanation = {
+        "layers": {},
+        "primary_layer": primary_layer,
+        "layer_scores": layer_scores,
+        "is_cpc_authoritative": False,
+        "decomposition_mode": "hardcoded_fallback",
+    }
 
     logger.info(
-        "Phase 2A: Layer decomposition - primary=%s, layers=%s",
+        "Phase 2A-Layer (hardcoded fallback): primary=%s, layers=%s",
         primary_layer,
         list(layers.keys()),
     )
     logger.info(
-        "Phase 2A: Layer scores - %s",
+        "Phase 2A-Layer scores: %s",
         {k: f"{v:.2f}" for k, v in layer_scores.items()},
     )
 
-    if len(top_cpc_families) < 2:
-        from ..cpc_family_router import FALLBACK_FAMILIES
-
-        for fb in FALLBACK_FAMILIES:
-            if fb not in top_cpc_families:
-                top_cpc_families.append(fb)
-            if len(top_cpc_families) >= 2:
-                break
-        phase2a_reasoning += " Fallback families added."
-        logger.info("Phase 2A: Fallback applied, families=%s", top_cpc_families)
-
     # ─────────────────────────────
-    # PHASE 2B: Restricted XML Expansion
+    # PHASE 2A v2: Authoritative CPC Family Router
     # ─────────────────────────────
-    graph_classes = []
-    if classifier.knowledge_graph and classifier.knowledge_graph.embeddings:
-        logger.info(
-            "Phase 2B: Querying knowledge graph within families %s",
-            top_cpc_families,
-        )
-        try:
-            patent_text_for_search = f"{phase1.get('technical_object', '')} {phase1.get('core_function', '')} {system_context}"
-
-            if not classifier.knowledge_graph.bm25_index:
-                logger.info("Initializing hybrid retrieval (BM25 + cross-encoder)")
-                classifier.knowledge_graph.init_hybrid_retrieval()
-
-            if classifier.knowledge_graph.bm25_index:
-                logger.info("Using hybrid search (BM25 + embedding + cross-encoder)")
-                graph_results = classifier.knowledge_graph.hybrid_search(
-                    text=patent_text_for_search,
-                    top_k=20,
-                    bm25_k=200,
-                    use_cross_encoder=True,
-                )
-            else:
-                logger.info("Using legacy semantic search (no BM25)")
-                extracted_terms = list(term_importance.keys())[:15]
-                graph_results = classifier.knowledge_graph.find_initial_classes(
-                    patent_text=patent_text_for_search,
-                    extracted_terms=extracted_terms,
-                    top_k=10,
-                )
-
-            graph_classes = [
-                cls
-                for cls, score in graph_results
-                if score > 0.3 and any(cls.startswith(fam) for fam in top_cpc_families)
-            ]
-            logger.info(
-                "Phase 2B: Graph suggested classes (filtered): %s",
-                graph_classes,
-            )
-        except Exception as e:
-            logger.warning("Phase 2B graph query failed: %s", e)
-
-    combined_classes = []
-    seen = set()
-    for cls in graph_classes:
-        if cls not in seen:
-            seen.add(cls)
-            combined_classes.append(cls)
-
-    _tech_layers = {"pure_software", "data_reasoning", "interaction", "control"}
-    _re_4char = re.compile(r"^([A-Z]\d{2}[A-Z])")
-    allowed_roots = []
-    root_seen = set()
-    layers = layer_result.get("layers", {})
-    for layer_name in _tech_layers:
-        for cand in layers.get(layer_name, []):
-            sym = cand.get("symbol", "")
-            m = _re_4char.match(sym)
-            if m:
-                prefix = m.group(1)
-                if prefix not in root_seen:
-                    root_seen.add(prefix)
-                    allowed_roots.append(prefix)
-    logger.info(
-        "Phase 2B: Allowed roots (4-char prefixes from tech layers): %s",
-        allowed_roots,
-    )
-
-    if not combined_classes:
-        combined_classes = allowed_roots
-
-    xml_dir = resolve_xml_dir()
-    available_files = set(os.listdir(xml_dir))
-    valid_combined = []
-    phase2b_skipped = []
-    for cls in combined_classes:
-        xml_name = f"cpc-scheme-{cls}.xml"
-        if xml_name in available_files:
-            valid_combined.append(cls)
-        else:
-            pattern = f"cpc-scheme-{cls}"
-            if any(f.startswith(pattern) for f in available_files):
-                valid_combined.append(cls)
-            else:
-                phase2b_skipped.append(cls)
-    if phase2b_skipped:
-        logger.warning(
-            "Phase 2B: Skipped %d classes with no XML files: %s",
-            len(phase2b_skipped),
-            phase2b_skipped,
-        )
-    combined_classes = valid_combined
-    allowed_roots = [r for r in allowed_roots if r in valid_combined]
-
-    logger.info("Phase 2B: Combined classes (filtered): %s", combined_classes)
-    logger.info(
-        "Phase 2B: Allowed roots (4-char prefixes from tech layers): %s",
-        allowed_roots,
-    )
-
-    # ─────────────────────────────
-    # PHASE 2C: XML Expansion + Scoring
-    # ─────────────────────────────
-    candidates = []
-    all_candidates = []
-    score_margin = 0.0
-    confidence_level = "medium"
-    phase2b_candidate_count = 0
-    phase2c_final_count = 0
-    phase2b_expansion_counts = {}
+    phase2a_v2_result: dict = {}
+    final_cpc_families: list = []
+    cpc_source: str = ""
+    fallback_used: bool = False
 
     try:
-        all_subgroups = classifier.xml_parser.expand_classes(
-            combined_classes,
-            include_non_allocatable=False,
-            allowed_roots=allowed_roots,
-        )
-        phase2b_candidate_count = len(all_subgroups)
+        v2_router = Phase2AV2Router(classifier.knowledge_graph)
+        phase2a_v2_result = v2_router.route(phase1, phase15_result, top_k=5)
+        if phase2a_v2_result.get("family_names"):
+            final_cpc_families = phase2a_v2_result["family_names"]
+            cpc_source = "phase_2a_v2"
+            logger.info(
+                "Phase 2A v2: %d families — %s",
+                len(final_cpc_families),
+                final_cpc_families,
+            )
+        else:
+            logger.error("Phase 2A v2 returned no families — fallback triggered")
+            fallback_used = True
+    except Exception as e:
+        logger.error("Phase 2A v2 failed: %s — fallback triggered", e)
+        fallback_used = True
 
+    if not final_cpc_families:
+        final_cpc_families = []
+        fallback_used = True
+
+    logger.info(
+        "Phase 2A FINAL: source=%s, fallback=%s, families=%s",
+        cpc_source or "none",
+        fallback_used,
+        final_cpc_families,
+    )
+
+    # Inject Phase 2A families into layer_result for Phase 2D fallback
+    layer_result["phase2a_families"] = final_cpc_families
+    layer_result["decomposition_mode"] = "hardcoded_fallback"
+
+    # ─────────────────────────────
+    # PHASE 2B: Hierarchical CPC Expansion
+    # ─────────────────────────────
+    phase2b_expansion_counts = {}
+
+    # Extract family scores from Phase 2A v2 result
+    family_scores: Dict[str, float] = {}
+    for fam_entry in phase2a_v2_result.get("families", []):
+        fam = fam_entry.get("family", "")
+        score = fam_entry.get("score", 0.0)
+        if fam:
+            family_scores[fam] = score
+
+    expander = Phase2BExpander(
+        knowledge_graph=classifier.knowledge_graph,
+        xml_parser=classifier.xml_parser,
+    )
+    phase2b_result = expander.expand(
+        families=final_cpc_families,
+        family_scores=family_scores,
+        phase1=phase1,
+        max_subgroups=500,
+    )
+
+    # ── Consistently read candidates from Phase 2B result ──
+    all_subgroups = phase2b_result.get("flat_candidates", phase2b_result.get("expanded_details", []))
+    expanded_cpcs = [sg.get("symbol", sg.get("code", "")) for sg in all_subgroups]
+    phase2b_candidate_count = len(all_subgroups)
+    
+    phase2b_source = phase2b_result["source"]
+    phase2b_fallback = phase2b_result["fallback_used"]
+    phase2b_family_counts = phase2b_result["family_counts"]
+    phase2b_family_expansions = phase2b_result["family_expansions"]
+    phase2b_pruned_count = phase2b_result["pruned_count"]
+    phase2b_raw_family_counts = phase2b_result.get("raw_family_counts", {})
+    phase2b_proportional_caps = phase2b_result.get("proportional_caps", {})
+
+    logger.info(
+        "Phase 2B: %d subgroups expanded (pruned %d) from %d families (source=%s, fallback=%s)",
+        phase2b_candidate_count,
+        phase2b_pruned_count,
+        len(final_cpc_families),
+        phase2b_source,
+        phase2b_fallback,
+    )
+
+    # Validation guard: Phase 2C must have candidates
+    if phase2b_candidate_count == 0:
+        logger.error(
+            "Phase 2B output empty or misformatted — Phase 2C will receive 0 candidates"
+        )
+
+    if phase2b_candidate_count > 0:
         for sg in all_subgroups:
             sym = sg.get("symbol", "")
             prefix = sym[:4] if len(sym) >= 4 else sym[:3]
@@ -226,394 +205,199 @@ def run_phase2(classifier, phase1, phase15_result=None, tcr_result=None):
             {k: v for k, v in sorted(phase2b_expansion_counts.items())},
         )
 
-        if all_subgroups:
-            title_count = len(all_subgroups)
-            doc_freq = Counter()
-            all_tokens = []
-            all_bigrams = []
+    # ─────────────────────────────
+    # PHASE 2C: Scoring Expanded Subgroups
+    # ─────────────────────────────
+    candidates = []
+    all_candidates = []
+    score_margin = 0.0
+    confidence_level = "medium"
+    phase2c_final_count = 0
 
-            for sg in all_subgroups:
-                context = sg.get("full_context", sg.get("title", "")).lower()
-                unigrams, bigrams = tokenize_with_bigrams(context)
-                all_tokens.append(unigrams)
-                all_bigrams.append(bigrams)
-                for token in unigrams:
-                    doc_freq[token] += 1
-                for bigram in bigrams:
-                    doc_freq[bigram] += 1
+    if all_subgroups:
+        logger.info(
+            "Phase 2C: Received %d candidates from Phase 2B (first: %s)",
+            len(all_subgroups),
+            all_subgroups[0].get("symbol", "unknown") if all_subgroups else "none",
+        )
+        title_count = len(all_subgroups)
+        # ─────────────────────────────
+        # BM25 Scoring (Replacing TF-IDF)
+        # ─────────────────────────────
+        # Extract cpc_terms with fallback for injection
+        cpc_terms = phase1.get("cpc_terms", [])
+        if not cpc_terms:
+            fallback = []
+            cfp = phase1.get("core_function_precise", "")
+            if cfp: fallback.append(cfp)
+            cfg = phase1.get("core_function_generalized", [])
+            if cfg: fallback.extend(cfg)
+            cpc_terms = fallback
+            
+        logger.info("[Phase 2C] Injected %d cpc_terms for BM25: %s", len(cpc_terms), cpc_terms)
 
-            scored = []
-            for idx, sg in enumerate(all_subgroups):
-                symbol = sg.get("symbol", "")
-                title = sg.get("title", "").lower()
-                context = sg.get("full_context", title).lower()
-                context_tokens = all_tokens[idx]
-                context_bigrams = all_bigrams[idx]
-                score = 0.0
-                matching_terms = 0
+        scored = score_candidates(
+            all_subgroups=all_subgroups,
+            term_importance=term_importance,
+            system_context=system_context,
+            core_function=core_function,
+            strategy=strategy,
+            phase2a_result=layer_result,
+            negative_signals=phase1.get("negative_signals", []),
+            cpc_terms=cpc_terms,
+            core_function_precise=phase1.get("core_function_precise", ""),
+            core_function_generalized=phase1.get("core_function_generalized", []),
+            evidence_table=phase1.get("evidence_table", []),
+        )
 
-                negative_signals = phase1.get("negative_signals", [])
-                negative_domains = phase1.get("negative_domains", [])
-                for neg in negative_signals:
-                    if isinstance(neg, dict):
-                        term = neg.get("term", "").lower()
-                        conf = neg.get("confidence", 0.5)
-                    else:
-                        term = str(neg).lower()
-                        conf = 0.5
-                    if term in context or term in title:
-                        score -= 5.0 * conf
+        scored.sort(key=lambda x: -x[0])
 
-                for neg in negative_domains:
-                    if isinstance(neg, dict):
-                        domain = neg.get("domain", "").lower()
-                        conf = neg.get("confidence", 0.5)
-                    else:
-                        domain = str(neg).lower()
-                        conf = 0.5
-                    if domain in context or domain in title:
-                        score -= 3.0 * conf
-
-                term_phrases = []
-                for term in term_importance.keys():
-                    words = term.split()
-                    if len(words) >= 2:
-                        for i in range(len(words) - 1):
-                            term_phrases.append(" ".join(words[i : i + 2]))
-                        for i in range(len(words) - 2):
-                            term_phrases.append(" ".join(words[i : i + 3]))
-
-                for term, importance in term_importance.items():
-                    term_score = 0.0
-                    term_tokens = _tokenize(term)
-                    if not term_tokens:
-                        continue
-
-                    if len(term.split()) >= 2 and term in context:
-                        avg_df = sum(doc_freq.get(t, 1) for t in term_tokens) / len(
-                            term_tokens
-                        )
-                        idf = math.log(title_count / max(avg_df, 1))
-                        importance_weight = importance / 5.0
-                        term_score += idf * importance_weight * 8
-                        matching_terms += 1
-
-                    term_bigrams = make_term_bigrams(term)
-                    if term_bigrams and context_bigrams:
-                        for tb in term_bigrams:
-                            if tb in context_bigrams:
-                                avg_df = doc_freq.get(tb, 1)
-                                idf = math.log(title_count / max(avg_df, 1))
-                                term_score += idf * (importance / 5.0) * 6
-                                matching_terms += 1
-
-                    overlap = term_tokens & context_tokens
-                    if overlap:
-                        overlap_idf = sum(
-                            math.log(title_count / max(doc_freq.get(t, 1), 1))
-                            for t in overlap
-                        )
-                        term_score += overlap_idf * (importance / 5.0) * 3
-
-                    if len(term.split()) == 1 and term in context:
-                        avg_df = sum(doc_freq.get(t, 1) for t in term_tokens) / len(
-                            term_tokens
-                        )
-                        idf = math.log(title_count / max(avg_df, 1))
-                        importance_weight = importance / 5.0
-                        base_score = idf * importance_weight * 5
-
-                        false_friend_penalty = 0.0
-                        if term in [
-                            "exchange",
-                            "response",
-                            "system",
-                            "user",
-                            "transfer",
-                        ]:
-                            if any(
-                                marker in context
-                                for marker in [
-                                    "data exchange",
-                                    "clipboard",
-                                    "dde",
-                                    "ole",
-                                    "fault response",
-                                    "error response",
-                                    "redundant",
-                                    "fault tolerance",
-                                    "backup",
-                                    "input device",
-                                    "brain wave",
-                                    "eeg",
-                                    "emg",
-                                    "printer",
-                                    "peripheral",
-                                ]
-                            ):
-                                false_friend_penalty = base_score * 0.7
-
-                        term_score += base_score - false_friend_penalty
-                        matching_terms += 1
-
-                    synonyms = get_expanded_terms(term)
-                    for syn in synonyms:
-                        if syn != term and syn in context:
-                            syn_tokens = _tokenize(syn)
-                            avg_df = sum(doc_freq.get(t, 1) for t in syn_tokens) / max(
-                                len(syn_tokens), 1
-                            )
-                            idf = math.log(title_count / max(avg_df, 1))
-                            term_score += idf * (importance / 5.0) * 4
-
-                    score += term_score
-
-                sys_tokens = _tokenize(system_context)
-                sys_overlap = sys_tokens & context_tokens
-                for token in sys_overlap:
-                    idf = math.log(title_count / max(doc_freq.get(token, 1), 1))
-                    score += idf * 2
-
-                func_tokens = _tokenize(core_function)
-                func_overlap = func_tokens & context_tokens
-                for token in func_overlap:
-                    idf = math.log(title_count / max(doc_freq.get(token, 1), 1))
-                    score += idf * 4
-
-                all_terms_text = " ".join(term_importance.keys())
-
-                nn_subject_signals = [
-                    "neural network",
-                    "neural networks",
-                    "deep learning",
-                    "llm",
-                    "large language model",
-                    "transformer",
-                    "model compression",
-                    "quantization",
-                    "weight quantization",
-                    "weight clipping",
-                    "model optimization",
-                    "inference optimization",
-                ]
-                has_nn_subject = any(
-                    sig in all_terms_text for sig in nn_subject_signals
-                )
-
-                image_signals = [
-                    "image",
-                    "pixel",
-                    "camera",
-                    "visual",
-                    "graphics",
-                    "rendering",
-                    "picture",
-                    "photograph",
-                ]
-                has_image_signal = any(sig in all_terms_text for sig in image_signals)
-
-                family3 = symbol[:3] if len(symbol) >= 3 else symbol
-                if has_nn_subject and not has_image_signal:
-                    if family3 in ["G06T", "G10K"]:
-                        score *= 0.2
-                        logger.debug(
-                            "Cross-domain guardrail: NN subject penalizes %s",
-                            family3,
-                        )
-
-                if has_nn_subject and family3 == "G06N":
-                    score *= 1.5
-                    logger.debug(
-                        "Model optimization boost: G06N boosted for NN subject"
-                    )
-
-                if "clipping" in all_terms_text:
-                    if "weight" in all_terms_text or "parameter" in all_terms_text:
-                        if family3 == "G06N":
-                            score *= 1.4
-                        elif family3 == "G06T":
-                            score *= 0.3
-                    elif any(sig in all_terms_text for sig in image_signals):
-                        if family3 == "G06T":
-                            score *= 1.3
-
-                base_multiplier = 1.2
-                class_prefix = symbol[:4] if len(symbol) >= 4 else symbol
-                family3 = symbol[:3] if len(symbol) >= 3 else symbol
-                phase2a_scores = phase2a_result.get("scores", {})
-                if class_prefix in phase2a_scores:
-                    base_multiplier = 1.0 + (phase2a_scores[class_prefix] * 1.0)
-                elif family3 in phase2a_scores:
-                    base_multiplier = 1.0 + (phase2a_scores[family3] * 1.0)
-                score *= base_multiplier
-
-                symbol_depth = symbol.count("/") + sum(
-                    symbol.count(d) for d in "0123456789"
-                )
-                if matching_terms >= 2:
-                    depth_bonus = min(symbol_depth * 0.5, 3.0)
-                    score += depth_bonus
-
-                if score > 0:
-                    scored.append((score, sg, matching_terms))
-
-            scored.sort(key=lambda x: -x[0])
-
-            # Hybrid scoring: TF-IDF + Semantic Similarity
-            sem_scores = {}
-            if classifier.knowledge_graph and classifier.knowledge_graph.embeddings:
-                patent_text = (
-                    phase1.get("technical_object", "")
-                    + " "
-                    + phase1.get("core_function", "")
-                )
-                sem_scores = compute_semantic_scores(
-                    [sg for _, sg, _ in scored], patent_text, classifier.knowledge_graph
-                )
-
-            if sem_scores:
-                max_tfidf = max(s[0] for s in scored) if scored else 1.0
-                hybrid_scored = []
-                for tfidf_score, sg, matching_terms in scored:
-                    sym = sg.get("symbol", "")
-                    tfidf_norm = tfidf_score / max_tfidf if max_tfidf > 0 else 0.0
-                    sem = sem_scores.get(sym, 0.0)
-                    hybrid = 0.4 * tfidf_norm + 0.6 * sem
-                    hybrid_scored.append((round(hybrid, 6), sg, matching_terms))
-                scored = hybrid_scored
-                scored.sort(key=lambda x: -x[0])
-                logger.info(
-                    "Hybrid scoring applied (0.4×TF-IDF + 0.6×Semantic) for %d candidates",
-                    len(scored),
-                )
-
-            all_candidates = []
-            if scored:
-                scores = [s[0] for s in scored]
-                max_score = max(scores)
-                median_score = (
-                    sorted(scores)[len(scores) // 2] if len(scores) > 1 else max_score
-                )
-                denom = max_score + median_score * 0.5
-
-                if len(scores) >= 2:
-                    score_margin = round((scores[0] - scores[1]) / denom, 6)
-                    if score_margin > 0.3:
-                        confidence_level = "high"
-                    elif score_margin < 0.1:
-                        confidence_level = "low"
-                    else:
-                        confidence_level = "medium"
-
-                all_candidates = []
-                for score, sg, _ in scored:
-                    normalized_score = min(score / denom, 1.0)
-                    all_candidates.append(
-                        {
-                            "symbol": sg["symbol"],
-                            "title": sg["title"],
-                            "level": sg.get("level", 0),
-                            "score": round(normalized_score, 6),
-                            "full_context": sg.get("full_context", sg["title"]),
-                        }
-                    )
-
-                phase2c_final_count = len(all_candidates)
-
-            logger.info(
-                "Phase 2C: Scored %d total candidates, margin=%.6f, confidence=%s",
-                phase2c_final_count,
-                score_margin,
-                confidence_level,
+        # ── BM25 + Embedding → RRF fusion ──
+        sem_scores = {}
+        if classifier.knowledge_graph and classifier.knowledge_graph.embeddings:
+            sem_scores = compute_semantic_scores(
+                [sg for _, sg, _ in scored],
+                patent_text="",  # not used when core_function is provided
+                knowledge_graph=classifier.knowledge_graph,
+                core_function=phase1.get("core_function", ""),
+                evidence_table=phase1.get("evidence_table", []),
             )
-    except Exception as e:
-        logger.error("Phase 2 expansion failed: %s", e)
 
-    # ─────────────────────────────
-    # PHASE 2D: Subclass Structural Anchor + Find-Until-Full
-    # ─────────────────────────────
+        if sem_scores:
+            scored = compute_rrf_fusion(scored, sem_scores)
+            logger.info(
+                "Phase 2C: RRF fusion applied (BM25 + embedding) for %d candidates",
+                len(scored),
+            )
+        else:
+            logger.info(
+                "Phase 2C: No KG embeddings available — BM25-only ranking kept"
+            )
+
+        # ── Transition to Phase 2D: Build candidates + trace scoring split ──
+        all_candidates = []
+        if scored:
+            scores = [s[0] for s in scored]
+            max_val = max(scores) if scores else 1.0
+            median_val = sorted(scores)[len(scores) // 2] if len(scores) > 1 else max_val
+            denom = max(max_val + median_val * 0.5, 1.0)
+            
+            # Re-calculate margin and confidence
+            if len(scores) >= 2:
+                score_margin = round((scores[0] - scores[1]) / denom, 6)
+                if score_margin > 0.3:
+                    confidence_level = "high"
+                elif score_margin < 0.1:
+                    confidence_level = "low"
+                else:
+                    confidence_level = "medium"
+            
+            for score, sg, _ in scored:
+                normalized_score = min(score / denom, 1.0)
+                all_candidates.append({
+                    "symbol": sg.get("symbol", ""),
+                    "title": sg.get("title", ""),
+                    "level": sg.get("level", 0),
+                    "score": round(normalized_score, 6),
+                    "full_context": sg.get("full_context", sg.get("title", "")),
+                })
+        
+        # EXACT PRINT STATEMENT REQUESTED BY USER
+        candidates = all_candidates # Rename to match user snippet
+        non_zero = sum(1 for c in candidates if c.get('score', 0) > 0)
+        print(f"Phase 2C Scoring Split: {non_zero} non-zero / {len(candidates) - non_zero} zero-score candidates")
+
+        phase2c_final_count = len(all_candidates)
+        logger.info(
+            "Phase 2C: Scored %d candidates. Passing all to Phase 2D.",
+            phase2c_final_count,
+        )
+
+        # ── Family-level score normalization ──
+        # Rescale each family's scores so its best candidate = Phase 2A relevance score.
+        # Without this, high-subgroup families (G10L) dominate Phase 3 purely by volume,
+        # creating a 6× gap vs low-subgroup families (G06N) regardless of actual relevance.
+        if family_scores and all_candidates:
+            fam_groups: Dict[str, list] = {}
+            for i, c in enumerate(all_candidates):
+                fam = c.get("symbol", "")[:4]
+                fam_groups.setdefault(fam, []).append(i)
+            for fam, indices in fam_groups.items():
+                max_score = max(all_candidates[i].get("score", 0) for i in indices)
+                p2a_weight = family_scores.get(fam, 0.0)
+                if max_score > 0 and p2a_weight > 0:
+                    for i in indices:
+                        all_candidates[i]["score"] = round(
+                            (all_candidates[i]["score"] / max_score) * p2a_weight, 6
+                        )
+            logger.info(
+                "Phase 2C: Family normalization applied — %d families rescaled to Phase 2A weights",
+                len(fam_groups),
+            )
+
+    _TOP_N = 50
     phase2d_result = {}
     find_until_full_log = []
     candidates = []
     try:
-        anchor_filter = Phase2DSubclassAnchor()
-        search_depths = [500, 1000, len(all_candidates) if all_candidates else 0]
-        search_depths = [d for d in search_depths if d > 0]
-
-        for depth in search_depths:
-            batch = all_candidates[:depth]
-            phase2d_result = anchor_filter.filter(
-                candidates=batch,
-                layer_result=layer_result,
-                max_result=depth,
-            )
-            survivors = phase2d_result.get("purified_candidates", [])
-            kept = len(survivors)
-
-            entry = {
-                "depth": depth,
-                "survivors_found": kept,
-                "deep_search_triggered": kept < 20,
-            }
-            find_until_full_log.append(entry)
-
-            if kept >= 20 or depth == search_depths[-1]:
-                if depth == 500 and kept >= 20:
-                    logger.info(
-                        "Find-Until-Full: Scanned %d to find %d valid technical anchors. ✓ Quota met.",
-                        depth,
-                        kept,
-                    )
-                elif kept >= 20:
-                    logger.info(
-                        "Deep Search required. Scanned %d to find %d valid technical anchors. ✓ Quota met.",
-                        depth,
-                        kept,
-                    )
-                else:
-                    logger.warning(
-                        "Find-Until-Full exhausted: Scanned %d to find only %d valid technical anchors. Using all survivors.",
-                        depth,
-                        kept,
-                    )
-                candidates = survivors
-                break
-            else:
-                logger.info(
-                    "Deep Search required. Scanned %d to find %d valid technical anchors. Expanding to next depth.",
-                    depth,
-                    kept,
-                )
-
+        phase2d_result = Phase2DSubclassAnchor().filter(
+            candidates=all_candidates,
+            layer_result=layer_result,
+            max_result=_TOP_N,
+        )
+        candidates = phase2d_result.get("purified_candidates", [])
+        find_until_full_log = [{
+            "depth": len(all_candidates),
+            "survivors_found": len(candidates),
+            "deep_search_triggered": False,
+        }]
         logger.info(
-            "Phase 2D: Final — kept=%d discarded=%d anchor_subclasses=%s",
+            "Phase 2D: Top-%d filter — Input=%d → Kept=%d → Discarded=%d",
+            _TOP_N,
+            len(all_candidates),
             phase2d_result.get("kept_count", 0),
             phase2d_result.get("discarded_count", 0),
-            ", ".join(phase2d_result.get("anchor_set", [])),
         )
     except Exception as e:
-        logger.warning("Phase 2D anchor filter failed: %s", e)
+        logger.warning("Phase 2D filter failed: %s", e)
 
     phase2_dict = {
+        "phase2a_layers": layer_result,
+        "layer_explanation": layer_explanation,
+        "phase2a_v2": phase2a_v2_result,
+        "final_cpc_families": final_cpc_families,
+        "cpc_source": cpc_source,
+        "fallback_used": fallback_used,
         "codes": [node["symbol"] for node in candidates] if candidates else [],
         "reasoning": (
-            "Multi-layer CPC decomposition: each technical layer maps to CPC independently. "
-            "No cross-layer penalties. No forced hierarchy. "
-            f"Primary layer={primary_layer}. "
-            f"Layer scores={ {k: round(v, 2) for k, v in layer_scores.items()} }. "
+            f"Phase 2A v2: {len(final_cpc_families)} families via "
+            f"embedding+KG+anchor fusion. "
+            f"Layer explanation: primary={primary_layer}. "
             f"Phase 2B expanded to {phase2b_candidate_count} candidates, "
             f"Phase 2C scored down to {phase2c_final_count}."
         ),
         "score_margin": round(score_margin, 6),
         "confidence_level": confidence_level,
-        "phase2a_source": phase2a_source,
-        "phase2a_reasoning": phase2a_reasoning,
-        "phase2a_families": top_cpc_families,
+        "phase2a_source": cpc_source,
+        "phase2a_reasoning": (
+            f"Authoritative CPC families from Phase 2A v2. "
+            f"{len(final_cpc_families)} families. "
+            f"Fallback used: {fallback_used}."
+        ),
+        "phase2a_families": final_cpc_families,
         "phase2a_primary_layer": primary_layer,
         "phase2a_layer_scores": {k: round(v, 4) for k, v in layer_scores.items()},
         "phase2b_candidate_count": phase2b_candidate_count,
         "phase2b_expansion_counts": phase2b_expansion_counts,
-        "phase2b_skipped_classes": phase2b_skipped,
+        "phase2b_source": phase2b_source,
+        "phase2b_fallback_used": phase2b_fallback,
+        "phase2b_family_counts": phase2b_family_counts,
+        "phase2b_family_expansions": phase2b_family_expansions,
+        "phase2b_pruned_count": phase2b_pruned_count,
+        "phase2b_raw_family_counts": phase2b_raw_family_counts,
+        "phase2b_proportional_caps": phase2b_proportional_caps,
+        "phase2b_output_type": "flat+structured",
+        "phase2c_input_size": phase2b_candidate_count,
         "phase2c_final_count": phase2c_final_count,
         "phase2d_anchor_set": phase2d_result.get("anchor_set", []),
         "phase2d_anchor_source": phase2d_result.get("anchor_source", []),
@@ -622,6 +406,7 @@ def run_phase2(classifier, phase1, phase15_result=None, tcr_result=None):
         "phase2d_discard_log": phase2d_result.get("discard_log", []),
         "phase2d_find_until_full": find_until_full_log,
         "phase2c_total_scored": phase2c_final_count,
+        "phase2a_v2_result": phase2a_v2_result,
     }
 
     return candidates, all_candidates, phase2_dict, phase2d_result, find_until_full_log

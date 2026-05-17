@@ -17,33 +17,6 @@ from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-FORCE_SOFTWARE_CORE = "FORCE_SOFTWARE_CORE"
-FORCE_DOMAIN_CORE = "FORCE_DOMAIN_CORE"
-HYBRID_INVENTION = "HYBRID_INVENTION"
-
-TCR_FORCE_THRESHOLDS = {
-    FORCE_SOFTWARE_CORE: 2.0,
-    FORCE_DOMAIN_CORE: 0.5,
-}
-
-CPC_PRIORITY_BY_FORCE = {
-    FORCE_SOFTWARE_CORE: {
-        "primary": ["G06F", "G06N", "G06K", "G06Q", "G10L", "G06V"],
-        "secondary": ["G05B", "G10L"],
-        "deprioritize": ["A61", "B23", "B60", "F16", "C08", "H02"],
-    },
-    FORCE_DOMAIN_CORE: {
-        "primary": ["A61", "B23", "B60", "F16", "C08", "E21", "H01"],
-        "secondary": ["G06F", "G05B"],
-        "deprioritize": ["G06N", "G06V"],
-    },
-    HYBRID_INVENTION: {
-        "primary": ["G06F", "G06N"],
-        "secondary": ["G05B", "G10L", "G06V"],
-        "deprioritize": [],
-    },
-}
-
 
 # Domain mapping: domain name -> CPC families
 DOMAIN_TO_CPC = {
@@ -1040,11 +1013,9 @@ class CPCDecisionTreeConstraint:
             phase1_data: Phase 1 output
             layer_data: Optional Phase 2A layer decomposition output
                         If provided, uses multi-layer model instead of single-domain dominance.
-            tcr_result: Optional Technical Weight Analysis result (from technical_weight_analyzer.py)
-                        If provided, applies TCR-based precedence:
-                        - TCR > 2.0: FORCE_SOFTWARE_CORE (G06F/G06N priority)
-                        - TCR < 0.5: FORCE_DOMAIN_CORE (A/B/F sections priority)
-                        - 0.5 <= TCR <= 2.0: HYBRID_INVENTION (balanced)
+            tcr_result: Optional Technical Weight Analysis result.
+                        Provides a soft bias signal (non-authoritative).
+                        Does NOT exclude CPC families — always keeps full search space.
 
         Returns:
             Dict with adjusted candidates, rules log, and domain decision.
@@ -1055,16 +1026,16 @@ class CPCDecisionTreeConstraint:
         self.rules_log = []
         candidates = [dict(c) for c in ranked_candidates]  # Copy
 
-        # Step 0: TCR-based precedence (highest priority override)
-        tcr_force_flag = None
-        if tcr_result:
-            tcr_force_flag = tcr_result.get("force_flag", HYBRID_INVENTION)
+        # Pre-filter: remove non-allocatable class/family nodes (symbols without "/").
+        # These are hierarchy anchors (e.g. "G10L"), never valid CPC subgroups.
+        before_prefilter = len(candidates)
+        candidates = [c for c in candidates if "/" in c.get("symbol", "")]
+        removed = before_prefilter - len(candidates)
+        if removed:
             logger.info(
-                "Phase 3.5: TCR force_flag=%s (TCR=%.3f)",
-                tcr_force_flag,
-                tcr_result.get("tcr", 1.0),
+                "Phase 3.5: Removed %d non-allocatable class nodes (no '/' in symbol)",
+                removed,
             )
-            candidates = self._apply_tcr_precedence(candidates, tcr_result)
 
         # Step 1: Detect primary domain (or layers)
         primary_domain, domain_confidence = self._detect_primary_domain(phase1_data)
@@ -1128,6 +1099,11 @@ class CPCDecisionTreeConstraint:
 
         # Step 7: Normalization
         candidates = self._normalize_scores(candidates)
+
+        # Step 7a: TCR soft bias — small multiplicative adjustment, non-authoritative.
+        # Does NOT exclude families. Applies: score *= (1 + alpha * tcr_bias * confidence).
+        if tcr_result:
+            candidates = self._apply_tcr_soft_bias(candidates, tcr_result)
 
         # Step 8: Tag each candidate as PRIMARY_STANDARD or SECONDARY_INDEXING
         # Standard codes: main groups (e.g., G06F 8/447, G05B 19/042)
@@ -1218,9 +1194,7 @@ class CPCDecisionTreeConstraint:
             "phase35_adjustments": len(self.rules_log),
             "phase35_layer_mode": layer_data is not None and all_layer_cpcs,
             "phase35_tcr": tcr_result.get("tcr") if tcr_result else None,
-            "phase35_tcr_force_flag": tcr_result.get("force_flag")
-            if tcr_result
-            else None,
+            "phase35_tcr_bias": tcr_result.get("tcr_bias") if tcr_result else 0.0,
         }
 
     def _apply_multi_layer_constraints(
@@ -1325,76 +1299,68 @@ class CPCDecisionTreeConstraint:
 
         return None, 0.0
 
-    def _apply_tcr_precedence(
+    def _apply_tcr_soft_bias(
         self,
         candidates: List[Dict[str, Any]],
         tcr_result: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """
-        Apply TCR-based precedence logic BEFORE other constraints.
+        Apply TCR as a non-authoritative downstream metadata bias.
 
-        TCR (Technical Character Ratio) determines whether the invention
-        is primarily computational (software) or physical (domain-specific).
+        TCR is stored in shared pipeline state after Phase 1 and passed
+        unchanged through Phase 2 (no filtering, no CPC exclusion). Only
+        here, at the final Phase 3 scoring step, is it applied as a small
+        multiplicative adjustment.
 
-        Rules:
-        - TCR > 2.0 (FORCE_SOFTWARE_CORE): Boost G06F/G06N, penalize A/B/F sections
-        - TCR < 0.5 (FORCE_DOMAIN_CORE): Boost A/B/F sections, penalize G06N
-        - 0.5 <= TCR <= 2.0 (HYBRID_INVENTION): Balanced approach
+        Formula: FinalScore = BaseScore * (1 + alpha * effective_bias)
+
+        Safety guarantees:
+          - NEVER uses raw tcr_bias directly
+          - Always uses effective_bias = tcr_bias * confidence
+          - Clamped to [-0.3, 0.3] to prevent any unexpected spikes
+          - Max impact capped at ~±6% of BaseScore
+          - BaseScore always dominates
+          - Deactivated when confidence < 0.2 (ultra‑safe mode)
         """
-        force_flag = tcr_result.get("force_flag", HYBRID_INVENTION)
+        bias = tcr_result.get("tcr_bias", 0.0)
+        confidence = tcr_result.get("confidence", 0.0)
         tcr = tcr_result.get("tcr", 1.0)
-        priority_map = CPC_PRIORITY_BY_FORCE.get(
-            force_flag, CPC_PRIORITY_BY_FORCE[HYBRID_INVENTION]
-        )
+        ALPHA = 0.2
 
-        primary_families = priority_map["primary"]
-        secondary_families = priority_map["secondary"]
-        deprioritize_families = priority_map["deprioritize"]
+        # Ultra‑safe: disable TCR when evidence is too weak
+        if confidence < 0.2:
+            effective_bias = 0.0
+        else:
+            effective_bias = bias * confidence
 
+        # Clamp to prevent any unexpected spikes
+        effective_bias = max(min(effective_bias, 0.3), -0.3)
+
+        if abs(effective_bias) < 0.01:
+            return candidates
+
+        factor = 1.0 + ALPHA * effective_bias
         logger.info(
-            "TCR_PRECEDENCE: force=%s, tcr=%.3f, primary=%s, deprioritize=%s",
-            force_flag,
-            tcr,
-            primary_families,
-            deprioritize_families,
+            "TCR soft bias: α=%.2f, effective_bias=%.3f (clamped), factor=%.4f",
+            ALPHA,
+            effective_bias,
+            factor,
         )
 
         adjusted = []
         for candidate in candidates:
             symbol = candidate.get("symbol", "")
             score = candidate.get("score", 0)
-
-            if any(symbol.startswith(f) for f in primary_families):
-                old_score = score
-                score *= 2.0
-                self._log_rule(
-                    "TCR_PRIMARY",
-                    symbol,
-                    old_score,
-                    score,
-                    f"TCR={tcr:.2f}, force={force_flag}: primary family match",
-                )
-            elif any(symbol.startswith(f) for f in secondary_families):
-                old_score = score
-                score *= 1.3
-                self._log_rule(
-                    "TCR_SECONDARY",
-                    symbol,
-                    old_score,
-                    score,
-                    f"TCR={tcr:.2f}: secondary family match",
-                )
-            elif any(symbol.startswith(f) for f in deprioritize_families):
-                old_score = score
-                score *= 0.3
-                self._log_rule(
-                    "TCR_DEPRECATED",
-                    symbol,
-                    old_score,
-                    score,
-                    f"TCR={tcr:.2f}, force={force_flag}: deprioritized family",
-                )
-
+            old_score = score
+            score *= factor
+            score = max(score, 1e-4)
+            self._log_rule(
+                "TCR_BIAS",
+                symbol,
+                old_score,
+                score,
+                f"TCR={tcr:.2f}, effective_bias={effective_bias:.3f}, α={ALPHA:.2f}",
+            )
             candidate["score"] = round(score, 4)
             adjusted.append(candidate)
 

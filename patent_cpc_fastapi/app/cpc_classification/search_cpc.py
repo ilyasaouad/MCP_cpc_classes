@@ -12,7 +12,8 @@ from .extracting_cpc import CPCExtractor
 from .cpc_xml_parser import CPCXMLParser
 from .knowledge_graph import CPCKnowledgeGraph
 from .cpc_family_router import CPCFamilyRouter
-from .cpc_layer_decomposer import CPCLayerDecomposer, merge_layers_to_family_list
+
+# CPCLayerDecomposer archived — no longer imported
 from .cpc_hypothesis_consolidation import CPCHypothesisConsolidator
 from .cpc_hypothesis_resolver import CPCHypothesisResolver
 from .cpc_decision_tree import CPCDecisionTreeConstraint
@@ -37,7 +38,8 @@ from .prompts.prompt_phases_35_4_7 import (
 from .prompts.prompt_phase1 import score_phase1_completeness
 
 # ── Pipeline runners ──
-from .pipeline.phase1_runner import run_phase1
+from .pipeline.phase1_runner import run_phase1, build_classification_quality
+from .pipeline.phase1_2_runner import run_phase1_2, apply_phase1_2_result
 from .pipeline.phase15_tcr_runner import run_phase15_tcr
 from .pipeline.phase2_runner import run_phase2
 from .pipeline.phase3_runner import run_phase3
@@ -61,8 +63,17 @@ from .utils.xml_utils import resolve_xml_dir as _resolve_xml_dir_static
 logger = logging.getLogger(__name__)
 
 
-def _build_term_importance(phase1: Dict[str, Any]) -> Dict[str, int]:
-    """Build weighted term importance dict from Phase 1 output."""
+def _build_term_importance(
+    phase1: Dict[str, Any],
+    phase1_2_result: Dict[str, Any] | None = None,
+) -> Dict[str, int]:
+    """Build weighted term importance dict from Phase 1 output.
+
+    If Phase 1.2 audit result is provided, applies domain-based weighting:
+    - Terms matching the primary anchor domain get weight 0.7 (× their importance)
+    - Terms matching secondary anchor domains get weight 0.3
+    - All other terms keep their base importance unchanged
+    """
     term_importance: Dict[str, int] = {}
     terms = phase1.get("terms", phase1.get("essential_terms", []))
     for t in terms:
@@ -72,6 +83,30 @@ def _build_term_importance(phase1: Dict[str, Any]) -> Dict[str, int]:
         for t in phase1.get("essential_terms", []):
             if isinstance(t, dict) and "term" in t:
                 term_importance[t["term"]] = t.get("importance", 5)
+
+    # ── Domain-based weighting (Phase 1.2 anchors) ──
+    if phase1_2_result and phase1_2_result.get("audit_status") == "SUCCESS":
+        primary = phase1_2_result.get("final_primary_anchor", "")
+        secondaries = set(phase1_2_result.get("secondary_anchors", []))
+
+        # Build term → domain lookup from disambiguated_terms
+        term_domain: Dict[str, str] = {}
+        for dt in phase1.get("disambiguated_terms", []):
+            if isinstance(dt, dict) and dt.get("term"):
+                term_domain[dt["term"].lower()] = dt.get("domain", "")
+
+        weighted: Dict[str, int] = {}
+        for term_name, importance in term_importance.items():
+            domain = term_domain.get(term_name.lower(), "")
+            if domain and domain == primary:
+                weighted[term_name] = max(1, round(importance * 0.7))
+            elif domain and domain in secondaries:
+                weighted[term_name] = max(1, round(importance * 0.3))
+            else:
+                weighted[term_name] = importance
+
+        return weighted
+
     return term_importance
 
 
@@ -88,10 +123,37 @@ class CPCClassifier:
     ):
         self.llm = OllamaClient(model_name=model_name)
         self.extractor = CPCExtractor(self.llm)
-        self.xml_parser = CPCXMLParser(_resolve_xml_dir())
+        self.xml_parser = CPCXMLParser(_resolve_xml_dir_static())
         self.knowledge_graph = knowledge_graph
         self.family_router = CPCFamilyRouter(knowledge_graph, max_families=3)
-        self.layer_decomposer = CPCLayerDecomposer(knowledge_graph)
+        # self.layer_decomposer archived — LLM decomposer removed
+
+    @staticmethod
+    def _parse_input(text: str, claims: str) -> Tuple[str, str]:
+        """Parse input text into description and labeled claims."""
+        description = text
+        labeled_claims = ""
+        if claims:
+            labeled_claims = label_claims(claims)
+        elif "CLAIMS:" in text or "claims:" in text.lower():
+            parts = re.split(r"CLAIMS:|claims:", text, flags=re.IGNORECASE, maxsplit=1)
+            if len(parts) == 2:
+                description = parts[0].strip()
+                claims_text = parts[1].strip()
+                labeled_claims = label_claims(claims_text)
+
+        # Diagnostic: log claim parsing results
+        claim_count = labeled_claims.count("[INDEPENDENT]") + labeled_claims.count(
+            "[DEPENDENT"
+        )
+        logger.info(
+            "Input parsed: desc=%d chars, claims=%d claims (%d chars)",
+            len(description),
+            claim_count,
+            len(labeled_claims),
+        )
+
+        return description, labeled_claims
 
     def classify(self, text: str, claims: str = "") -> Dict[str, Any]:
 
@@ -104,13 +166,51 @@ class CPCClassifier:
         # PHASE 1: Extraction
         # ─────────────────────────────
         phase1 = run_phase1(self, description, labeled_claims)
-        if "error" in phase1:
+        if isinstance(phase1, dict) and phase1.get("error"):
+            phase1["classification_quality"] = build_classification_quality(phase1)
             return phase1
+
+        # ─────────────────────────────
+        # PHASE 1.2: Mandatory Forensic Audit (Claim-to-Domain)
+        # ─────────────────────────────
+        phase1_2_result = run_phase1_2(self, phase1, labeled_claims)
+        apply_phase1_2_result(phase1, phase1_2_result)
 
         # ─────────────────────────────
         # PHASE 1.5 + TCR
         # ─────────────────────────────
         phase15_result, tcr_result = run_phase15_tcr(self, phase1)
+
+        logger.info("=" * 60)
+        logger.info("[DEBUG] Phase 1.5 — Role Classification + TCR")
+
+        # 1. Role Classification
+        logger.info("Role: %s", phase15_result.get("role", "MISSING"))
+        logger.info("Role Confidence: %.2f", phase15_result.get("confidence", 0))
+        logger.info(
+            "Role Reasoning: %s",
+            phase15_result.get("reasoning", "MISSING")[:200],
+        )
+
+        # 2. TCR Analysis
+        logger.info("TCR Score: %.3f", tcr_result.get("tcr", "MISSING"))
+        logger.info("TCR Bias: %.3f", tcr_result.get("tcr_bias", "MISSING"))
+        logger.info(
+            "Computational Score: %.2f",
+            tcr_result.get("computational_score", 0),
+        )
+        logger.info("Physical Score: %.2f", tcr_result.get("physical_score", 0))
+        logger.info("Force Mode: %s", tcr_result.get("force_mode", "MISSING"))
+        logger.info("Override Applied: %s", tcr_result.get("override_applied", False))
+
+        # 3. Check if TCR fallback was used (indicates failure)
+        if tcr_result.get("confidence") == 0.0 and tcr_result.get("tcr") == 1.0:
+            logger.warning(
+                "⚠️ TCR RESULT IS FALLBACK — "
+                "TechnicalWeightAnalyzer.analyze() likely failed!"
+            )
+
+        logger.info("=" * 60)
 
         # ─────────────────────────────
         # PHASE 2: Layer decomposition → XML expansion → Scoring → Anchor filter
@@ -130,7 +230,10 @@ class CPCClassifier:
         # ─────────────────────────────
         # PHASE 4 + 5: Consolidation + Resolution + Tri-Pillar
         # ─────────────────────────────
-        term_importance = _build_term_importance(phase1)
+        # Inject Phase 2A families so Tri-Pillar definitions are patent-specific
+        phase1["phase2a_families"] = phase2_dict.get("phase2a_families", [])
+
+        term_importance = _build_term_importance(phase1, phase1_2_result)
         phase4_result, phase5_result = run_phase4_5(
             self, ranked, phase1, all_candidates, term_importance
         )
@@ -175,11 +278,12 @@ class CPCClassifier:
         # Assemble result
         # ─────────────────────────────
         result = {
+            "classification_quality": build_classification_quality(phase1),
             "phase1": phase1,
+            "phase1_2": phase1_2_result,
             "phase15": phase15_result,
             "tcr_analysis": tcr_result,
             "phase2": phase2_dict,
-            "phase2a_layers": layer_result,
             "phase3": ranked,
             "phase35": phase35_result,
             "phase36": phase36_result,
@@ -192,6 +296,8 @@ class CPCClassifier:
             result["phase5"] = phase5_result
         if premier_data:
             result["premier"] = premier_data
+        if isinstance(phase1, dict) and phase1.get("phase1_status_note"):
+            result["phase1_status_note"] = phase1["phase1_status_note"]
 
         return result
 
@@ -441,8 +547,13 @@ class CPCClassifier:
             for node in ranked[:5]
         ]
 
-        return {
+        result = {
+            "classification_quality": build_classification_quality(phase1),
             "phase1": phase1,
+            "phase1_2": {
+                "audit_status": "SKIPPED",
+                "reason": "Manual Phase 1 bypass — claims text not available for forensic audit",
+            },
             "phase2": {
                 "codes": [node["symbol"] for node in ranked],
                 "reasoning": f"Manual Phase 1 → Phase 2A routed to {top_cpc_families}",
@@ -467,6 +578,9 @@ class CPCClassifier:
             "phase5": phase5_result,
             "cpc": cpc,
         }
+        if isinstance(phase1, dict) and phase1.get("phase1_status_note"):
+            result["phase1_status_note"] = phase1["phase1_status_note"]
+        return result
 
     def _compute_semantic_scores(
         self, candidates: List[Dict], patent_text: str
@@ -769,18 +883,21 @@ class CPCClassifier:
         all_listed = set()
         for c in [core, support, context_codes, coverage]:
             for item in c:
-                all_listed.add(item.get("symbol", ""))
+                if isinstance(item, dict):
+                    all_listed.add(item.get("symbol", ""))
 
         # Collect pillars symbols already shown
         pillar_symbols = set()
         if pillars:
             for k, v in pillars.items():
-                if v.get("symbol"):
+                if isinstance(v, dict) and v.get("symbol"):
                     pillar_symbols.add(v["symbol"])
 
         suggested = []
         for c in [core, support, context_codes, coverage]:
             for item in c:
+                if not isinstance(item, dict):
+                    continue
                 sym = item.get("symbol", "")
                 if sym not in pillar_symbols and sym != premier_symbol:
                     title = item.get("title", "")
@@ -807,17 +924,26 @@ class CPCClassifier:
             if core:
                 lines.append("**Core Invention:**")
                 for c in core:
-                    lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                    if isinstance(c, dict):
+                        lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                    else:
+                        lines.append(f"- `{c}`")
                 lines.append("")
             if support:
                 lines.append("**Enabling Technology:**")
                 for c in support:
-                    lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                    if isinstance(c, dict):
+                        lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                    else:
+                        lines.append(f"- `{c}`")
                 lines.append("")
             if context_codes:
                 lines.append("**Application Context:**")
                 for c in context_codes:
-                    lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                    if isinstance(c, dict):
+                        lines.append(f"- `{c.get('symbol', '')}` — {c.get('title', 'N/A')}")
+                    else:
+                        lines.append(f"- `{c}`")
                 lines.append("")
 
         return "\n".join(lines)
@@ -842,7 +968,7 @@ class CPCClassifier:
             symbol = consistency_result["recommended_primary"]
             title = ""
             for node in (validated_candidates or []) + (ranked or []):
-                if node.get("symbol") == symbol:
+                if isinstance(node, dict) and node.get("symbol") == symbol:
                     title = node.get("title", "")
                     break
             return {
@@ -862,12 +988,21 @@ class CPCClassifier:
                 "reasoning": best_code.get("reasoning", ""),
             }
         if ranked:
-            return {
-                "symbol": ranked[0]["symbol"],
-                "title": ranked[0]["title"],
-                "confidence": "medium",
-                "reasoning": "Top-scoring candidate from Phase 2/3 scoring",
-            }
+            top = ranked[0]
+            if isinstance(top, dict):
+                return {
+                    "symbol": top.get("symbol"),
+                    "title": top.get("title", ""),
+                    "confidence": "medium",
+                    "reasoning": "Top-scoring candidate from Phase 2/3 scoring",
+                }
+            else:
+                return {
+                    "symbol": str(top),
+                    "title": "N/A",
+                    "confidence": "medium",
+                    "reasoning": "Top-scoring candidate from Phase 2/3 scoring",
+                }
         return None
 
     @staticmethod

@@ -193,41 +193,22 @@ class CPCRoleLabeling:
             ),
             "phase85_executive_summary": llm_reasoning.get("executive_summary", ""),
             "phase85_code_reasoning": llm_reasoning.get("code_reasoning", []),
-            "tcr_force_flag": self.tcr_result.get("force_flag"),
             "tcr_value": self.tcr_result.get("tcr"),
+            "tcr_bias": self.tcr_result.get("tcr_bias"),
             "rules_log": self.rules_log,
         }
 
     def _select_core(
         self, candidates: List[Dict[str, Any]], phase36_result: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Select 1-2 CORE CPCs with TCR guidance."""
+        """Select 1-2 CORE CPCs."""
         core = []
         primary_type = phase36_result.get("phase36_primary_code", "")
-        force_flag = self.tcr_result.get("force_flag", "HYBRID_INVENTION")
 
-        # TCR-based primary families for CORE selection
-        if force_flag == "FORCE_SOFTWARE_CORE":
-            tcr_core_families = ["G06F", "G06N", "G06K", "G10L", "G06V"]
-        elif force_flag == "FORCE_DOMAIN_CORE":
-            tcr_core_families = ["A61", "B23", "B60", "F16", "C08", "H01"]
-        else:  # HYBRID_INVENTION
-            tcr_core_families = ["G06F", "G06N"]
-
-        # First: candidates with "primary" contribution match
+        # Candidates with "primary" contribution match
         primary_candidates = [
             c for c in candidates if c.get("contribution_match") == "primary"
         ]
-
-        # TCR-guided: prioritize candidates matching TCR force flag
-        if force_flag != "HYBRID_INVENTION" and primary_candidates:
-            tcr_guided = [
-                c
-                for c in primary_candidates
-                if any(c.get("symbol", "").startswith(f) for f in tcr_core_families)
-            ]
-            if tcr_guided:
-                primary_candidates = tcr_guided
 
         # Sort by score
         primary_candidates = sorted(
@@ -240,7 +221,7 @@ class CPCRoleLabeling:
             self._log_rule(
                 "CORE_SELECTED",
                 c.get("symbol", ""),
-                f"Primary contribution match (TCR={force_flag})",
+                "Primary contribution match",
             )
 
         # If no primary matches, take highest overall (with TCR guidance)

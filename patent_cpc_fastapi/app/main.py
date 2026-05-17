@@ -1,5 +1,9 @@
 import os
 import sys
+import logging
+
+# Trigger reload - rank_bm25 successfully installed
+logger = logging.getLogger(__name__)
 
 # Ensure app/ is on path so absolute imports like 'cpc_classification' resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -234,16 +238,18 @@ def classify(req: ClassifyRequest):
             manual_json = req.text[len("MANUAL_PHASE1:") :]
             manual_phase1 = json.loads(manual_json)
 
-            # Run pipeline starting from Phase 2 with manual Phase 1
             result = classifier.classify_from_phase1(manual_phase1)
         else:
-            # Combine description and claims if claims are provided
             full_text = req.text
             if req.claims:
                 full_text = f"DESCRIPTION:\n{req.text}\n\nCLAIMS:\n{req.claims}"
 
             result = classifier.classify(full_text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+
+        tb = traceback.format_exc()
+        logger.exception("Classification failed")
+        raise HTTPException(status_code=500, detail=tb)
 
     return result

@@ -1,456 +1,546 @@
 """
-technical_weight_analyzer.py - Technical Weight Analysis Engine
+technical_weight_analyzer.py - Stable Technical Character Analyzer (v2.2)
 
-Processes Phase 1 output to determine the invention's technical character.
-Used to guide CPC classification toward computational vs physical domain.
+PURPOSE:
+Replaces fragile keyword-heavy TCR with a balanced, deterministic scoring system.
 
-KEY ANALYSIS:
-1. Segmented Text Extraction: CLAIMS, ABSTRACT, DETAILED_DESCRIPTION_OF_DRAWINGS
-2. Bucket Classification: COMPUTATIONAL vs PHYSICAL/DOMAIN keywords
-3. Drawing-First Multiplier: 1.5x weight for terms in DETAILED_DESCRIPTION
-4. Technical Character Ratio (TCR): Computational / Physical weight
+DESIGN PRINCIPLES:
+- No LLM dependency
+- No CPC-based leakage
+- Balanced computational vs physical signal space
+- Uses structured term matching only
+- Acts as a ROUTING SIGNAL, not a classifier
 
-USAGE:
-    analyzer = TechnicalWeightAnalyzer()
-    result = analyzer.analyze(phase1_data)
-    # Returns: {tcr, force_flag, analysis_details, ...}
-
-TCR Thresholds:
-- TCR > 2.0: FORCE_SOFTWARE_CORE (G06F/G06N primary)
-- TCR < 0.5: FORCE_DOMAIN_CORE (A/B/C/F sections primary)
-- 0.5 <= TCR <= 2.0: HYBRID_INVENTION (both layers)
+CHANGELOG:
+v2.1 — Fixed signature mismatch with phase15_tcr_runner.py
+        Added missing output keys (tcr_bias, force_mode, override_applied, confidence)
+        Improved _match() to use word-boundary matching
+v2.2 — Fixed TCR explosion when physical_score = 0
+        Expanded computational keywords (lstm, weights, speech, phoneme, etc.)
+        Lowered confidence thresholds for low evidence counts
 """
 
 import logging
-from typing import Dict, List, Any, Optional
-from collections import Counter
+import re
+from typing import Dict, List, Any, Optional, Set
 
 logger = logging.getLogger(__name__)
 
 
-# COMPUTATIONAL keywords (The Tool)
-COMPUTATIONAL_KEYWORDS = {
-    "prompt",
-    "llm",
-    "large language model",
-    "code",
-    "syntax",
+# =========================
+# BALANCED TERM SEEDS
+# =========================
+
+COMPUTATIONAL_KEYWORDS: Set[str] = {
+    # Core computation
     "algorithm",
-    "data structure",
-    "executable",
-    "software",
-    "neural",
-    "inference",
-    "training",
-    "sequence",
-    "token",
-    "embedding",
-    "vector",
-    "model",
-    "network",
-    "layer",
-    "weight",
-    "parameter",
-    "gradient",
-    "optimization",
-    "loss",
-    "function",
     "computation",
     "processing",
     "pipeline",
     "workflow",
-    "orchestration",
-    "middleware",
-    "api",
+    "software",
+    "module",
+    "service",
     "interface",
-    "query",
-    "database",
-    "graph",
-    "rdf",
-    "sparql",
-    "semantic",
-    "nlp",
-    "nlu",
-    "parser",
-    "compiler",
-    "runtime",
-    "instruction",
-    "bytecode",
-    "script",
-    "programming",
+    "program",
+    # ML / AI architectures
+    "machine learning",
+    "deep learning",
+    "neural network",
+    "model",
+    "training",
+    "inference",
+    "optimization",
+    "embedding",
+    "feature extraction",
     "classification",
-    "prediction",
-    "regression",
     "clustering",
-    "feature",
-    "encoding",
-    "decoding",
+    "self-supervised",
+    "pre-training",
+    "pretraining",
+    "self supervised",
+    "encoder",
+    "decoder",
     "transformer",
     "attention",
+    "attention mechanism",
+    # Specific ML architectures (v2.2 — added)
+    "lstm",
+    "rnn",
+    "cnn",
+    "gru",
+    "bidirectional",
+    "weights",
+    "parameters",
+    "gradients",
+    "backpropagation",
+    "representation",
+    "representations",
+    "embedding",
+    "hidden layer",
+    "output layer",
+    "input layer",
+    "activation",
+    "loss function",
     "softmax",
-    "tensor",
-    "gpu",
-    "compute",
+    "token",
+    "tokenization",
+    "vocabulary",
+    # Data systems
+    "database",
+    "query",
+    "retrieval",
+    "indexing",
+    "vector",
+    "graph",
+    "api",
+    "cloud",
+    "distributed",
+    "parallel",
+    # Signal / language / speech (v2.2 — expanded)
+    "speech",
+    "speech recognition",
+    "speech processing",
+    "audio",
+    "audio processing",
+    "phoneme",
+    "phonemic",
+    "phonetic",
+    "acoustic",
+    "acoustic model",
+    "spectral",
+    "mfcc",
+    "nlp",
+    "tokenization",
+    "encoding",
+    "decoding",
+    "semantic",
+    "parser",
+    "utterance",
+    "voice",
+    "speaker",
 }
 
-# PHYSICAL/DOMAIN keywords (The Target)
-PHYSICAL_KEYWORDS = {
-    "plc",
-    "industrial plant",
-    "vehicle",
+
+PHYSICAL_KEYWORDS: Set[str] = {
+    # Mechanical
     "motor",
-    "chemical",
-    "molecular",
-    "pressure",
-    "valve",
-    "biological",
-    "patient",
-    "hardware",
-    "circuit",
-    "transistor",
-    "semiconductor",
-    "chip",
-    "pcb",
-    "sensor",
-    "actuator",
-    "mechanical",
     "engine",
     "pump",
+    "valve",
+    "gear",
+    "mechanism",
     "turbine",
-    "generator",
+    "actuator",
+    "machine",
+    "structure",
+    "shaft",
+    "bearing",
+    "spring",
+    "cam",
+    "crankshaft",
+    # Electrical / electronics
+    "circuit",
+    "sensor",
+    "transistor",
+    "chip",
+    "semiconductor",
+    "pcb",
     "battery",
+    "voltage",
+    "current",
     "electrical",
-    "electronic",
-    "hydraulic",
-    "pneumatic",
-    "fluid",
-    "pipe",
-    "tank",
-    "vessel",
-    "reactor",
-    "catalyst",
-    "polymer",
+    "resistor",
+    "capacitor",
+    "inductor",
+    "diode",
+    # Chemical / material
+    "chemical",
     "compound",
-    "formulation",
-    "dosage",
-    "therapeutic",
-    "diagnosis",
-    "surgical",
-    "implant",
-    "prosthetic",
-    "therapeutic",
-    "biomaterial",
-    "pharmaceutical",
-    "drug",
-    "crop",
-    "plant",
-    "soil",
-    "harvest",
-    "livestock",
-    "soil",
-    "fertilizer",
-    "irrigation",
-    "climate",
-    "weather",
-    "temperature",
-    "humidity",
+    "reaction",
     "material",
-    "metal",
     "polymer",
-    "composite",
-    "ceramic",
-    "alloy",
+    "solution",
+    "mixture",
+    "catalyst",
+    "substrate",
+    # Biomedical
+    "patient",
+    "tissue",
+    "cell",
+    "implant",
+    "drug",
+    "medical",
+    "diagnosis",
+    "therapy",
+    "surgical",
+    # Physical systems
+    "fluid",
+    "pressure",
+    "temperature",
+    "force",
+    "mechanical system",
+    "environment",
+    "vehicle",
+    "torque",
+    "friction",
+    "vibration",
+    "thermal",
 }
+
+# ═══════════════════════════════════════════════════════════════
+# Pre-compiled regex patterns for word-boundary matching
+# ═══════════════════════════════════════════════════════════════
+_COMP_PATTERNS = [
+    re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE) for k in COMPUTATIONAL_KEYWORDS
+]
+_PHYS_PATTERNS = [
+    re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE) for k in PHYSICAL_KEYWORDS
+]
+
+
+# =========================
+# ANALYZER
+# =========================
 
 
 class TechnicalWeightAnalyzer:
     """
-    Analyzes Phase 1 output to determine technical character.
-
-    Extracts text from CLAIMS, ABSTRACT, and DETAILED_DESCRIPTION_OF_DRAWINGS.
-    Classifies terms into COMPUTATIONAL vs PHYSICAL buckets.
-    Applies Drawing-First Multiplier (1.5x) for DETAILED_DESCRIPTION terms.
-    Calculates Technical Character Ratio (TCR).
+    Stable deterministic analyzer for computing technical bias.
     """
 
     def __init__(
         self,
-        computational_keywords: Optional[set] = None,
-        physical_keywords: Optional[set] = None,
-        drawing_multiplier: float = 1.5,
+        computational_keywords: Optional[Set[str]] = None,
+        physical_keywords: Optional[Set[str]] = None,
     ):
         self.computational_keywords = computational_keywords or COMPUTATIONAL_KEYWORDS
         self.physical_keywords = physical_keywords or PHYSICAL_KEYWORDS
-        self.drawing_multiplier = drawing_multiplier
 
-    def analyze(self, phase1_data: Dict[str, Any]) -> Dict[str, Any]:
+        # Build patterns if custom keywords provided
+        if computational_keywords is not None:
+            self._comp_patterns = [
+                re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE)
+                for k in computational_keywords
+            ]
+        else:
+            self._comp_patterns = _COMP_PATTERNS
+
+        if physical_keywords is not None:
+            self._phys_patterns = [
+                re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE)
+                for k in physical_keywords
+            ]
+        else:
+            self._phys_patterns = _PHYS_PATTERNS
+
+    # -------------------------
+    # MAIN ENTRY
+    # -------------------------
+
+    def analyze(
+        self,
+        phase1_data: Dict[str, Any],
+        phase1_5_result: Optional[Dict[str, Any]] = None,
+        domain_signals: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """
-        Analyze Phase 1 data to determine technical character.
+        Analyze technical weight of the invention.
 
         Args:
-            phase1_data: Output from Phase 1 containing:
-                - terms
-                - essential_terms
-                - technical_object
-                - core_function
-                - system_context
+            phase1_data: Phase 1 output with terms, domain_signals, etc.
+            phase1_5_result: Phase 1.5 role classification result (optional, for context).
+            domain_signals: Domain signals from Phase 1 (optional, for additional context).
 
         Returns:
-            Dict with:
-                - tcr: Technical Character Ratio (float)
-                - force_flag: FORCE_SOFTWARE_CORE | FORCE_DOMAIN_CORE | HYBRID_INVENTION
-                - computational_weight: Total weight in computational bucket
-                - physical_weight: Total weight in physical bucket
-                - computational_terms: List of matched computational terms
-                - physical_terms: List of matched physical terms
-                - drawing_terms: Terms found in DETAILED_DESCRIPTION
-                - analysis_details: Breakdown by section
+            Dict with TCR score, force mode, and detailed breakdown.
         """
-        # Extract text by section
-        claims_text = self._extract_section_text(phase1_data, "claims")
-        abstract_text = self._extract_section_text(phase1_data, "abstract")
-        detailed_text = self._extract_section_text(phase1_data, "detailed")
+        role = (phase1_5_result or {}).get("role", "")
+        role_confidence = (phase1_5_result or {}).get("confidence", 0.0)
 
-        # Extract terms from all sections
-        all_terms = self._extract_all_terms(phase1_data)
+        terms = self._extract_terms(phase1_data)
 
-        # Classify terms into buckets
-        computational_terms = []
-        physical_terms = []
-        drawing_terms = []
+        # Also extract from raw claims text and core_function for wider coverage
+        claims_terms = self._extract_claims_terms(phase1_data)
+        core_fn = phase1_data.get("core_function", "")
+        if core_fn:
+            parts = [
+                p.strip().lower() for p in re.split(r"[,;.\n]", core_fn) if p.strip()
+            ]
+            for p in parts:
+                word_count = len(p.split())
+                if word_count <= 6 and len(p) > 2:
+                    terms.append({"term": p, "importance": 8})
 
-        for term_info in all_terms:
-            term = term_info.get("term", "").lower()
-            section = term_info.get("source_section", "unknown").lower()
-            importance = term_info.get("importance", 5)
+        # Deduplicate terms with length guard
+        seen_terms = set()
+        deduped = []
+        for t in terms:
+            term_text = t["term"].lower().strip()
+            word_count = len(term_text.split())
+            if term_text and word_count <= 6 and term_text not in seen_terms:
+                seen_terms.add(term_text)
+                deduped.append(t)
+        terms = deduped
 
-            # Check computational bucket
-            if self._matches_keywords(term, self.computational_keywords):
-                # Apply multiplier if from detailed description
-                multiplier = self.drawing_multiplier if "detailed" in section else 1.0
-                weighted_importance = importance * multiplier
+        comp_score = 0.0
+        phys_score = 0.0
 
-                computational_terms.append(
-                    {
-                        "term": term,
-                        "section": section,
-                        "importance": importance,
-                        "weighted_importance": weighted_importance,
-                        "multiplier": multiplier,
-                        "bucket": "computational",
-                    }
-                )
+        comp_terms = []
+        phys_terms = []
 
-                if "detailed" in section:
-                    drawing_terms.append(term)
+        for t in terms:
+            term = t["term"].lower()
+            weight = t.get("importance", 5)
 
-            # Check physical bucket
-            elif self._matches_keywords(term, self.physical_keywords):
-                multiplier = self.drawing_multiplier if "detailed" in section else 1.0
-                weighted_importance = importance * multiplier
+            if self._match(term, self._comp_patterns):
+                comp_score += weight
+                comp_terms.append(term)
 
-                physical_terms.append(
-                    {
-                        "term": term,
-                        "section": section,
-                        "importance": importance,
-                        "weighted_importance": weighted_importance,
-                        "multiplier": multiplier,
-                        "bucket": "physical",
-                    }
-                )
+            elif self._match(term, self._phys_patterns):
+                phys_score += weight
+                phys_terms.append(term)
 
-                if "detailed" in section:
-                    drawing_terms.append(term)
+        # Also score claims terms directly (without adding to terms list)
+        for ct in claims_terms:
+            ct_lower = ct.lower()
+            if ct_lower not in seen_terms:
+                if self._match(ct_lower, self._comp_patterns):
+                    comp_score += 5
+                    comp_terms.append(f"[claims] {ct_lower}")
+                    seen_terms.add(ct_lower)
+                elif self._match(ct_lower, self._phys_patterns):
+                    phys_score += 5
+                    phys_terms.append(f"[claims] {ct_lower}")
+                    seen_terms.add(ct_lower)
 
-        # Calculate weighted totals
-        computational_weight = sum(
-            t["weighted_importance"] for t in computational_terms
-        )
-        physical_weight = sum(t["weighted_importance"] for t in physical_terms)
+        # -------------------------
+        # STABLE TCR COMPUTATION (v3.0 — no artifactual floors)
+        # -------------------------
+        # TCR is comp_score / phys_score with these rules:
+        #   phys_score == 0 → TCR based on comp_score magnitude (discriminative, not capped)
+        #   comp_score == 0 → TCR based on phys_score magnitude
+        #   both present    → ratio capped at [0.1, 10.0]
 
-        # Calculate TCR
-        if physical_weight > 0:
-            tcr = computational_weight / physical_weight
+        if comp_score == 0 and phys_score == 0:
+            tcr = 1.0
+        elif phys_score == 0:
+            tcr = min(comp_score * 0.5 + 1.0, 10.0)
+        elif comp_score == 0:
+            tcr = max(0.1, 1.0 - phys_score * 0.05)
         else:
-            # If no physical terms, assume computational
-            tcr = computational_weight if computational_weight > 0 else 1.0
+            tcr = min(max(comp_score / phys_score, 0.1), 10.0)
 
-        # Determine force flag
-        force_flag = self._determine_force_flag(tcr)
+        # -------------------------
+        # TCR BIAS (normalized asymmetry)
+        # -------------------------
+        total = comp_score + phys_score
+        if total > 0:
+            tcr_bias = (comp_score - phys_score) / total  # Range: -1.0 to +1.0
+        else:
+            tcr_bias = 0.0
 
-        # Analysis breakdown
-        analysis_details = {
-            "claims_computational": self._count_terms(computational_terms, "claims"),
-            "claims_physical": self._count_terms(physical_terms, "claims"),
-            "abstract_computational": self._count_terms(
-                computational_terms, "abstract"
-            ),
-            "abstract_physical": self._count_terms(physical_terms, "abstract"),
-            "detailed_computational": self._count_terms(
-                computational_terms, "detailed"
-            ),
-            "detailed_physical": self._count_terms(physical_terms, "detailed"),
-            "drawing_term_count": len(drawing_terms),
-        }
+        # -------------------------
+        # FORCE FLAG (SAFE THRESHOLDS)
+        # -------------------------
 
-        result = {
+        if tcr > 2.0:
+            force_mode = "FORCE_SOFTWARE_CORE"
+        elif tcr < 0.5:
+            force_mode = "FORCE_DOMAIN_CORE"
+        else:
+            force_mode = "HYBRID_INVENTION"
+
+        # -------------------------
+        # CONFIDENCE (v2.2 — stricter thresholds)
+        # -------------------------
+        total_evidence = len(comp_terms) + len(phys_terms)
+        if total_evidence >= 8:
+            confidence = 0.95
+        elif total_evidence >= 5:
+            confidence = 0.90
+        elif total_evidence >= 3:
+            confidence = 0.75
+        elif total_evidence >= 2:
+            confidence = 0.50
+        elif total_evidence >= 1:
+            confidence = 0.30  # Lowered from 0.50 — 1 match is weak evidence
+        else:
+            confidence = 0.0  # No evidence — neutral fallback
+
+        # -------------------------
+        # OVERRIDE (role-based adjustment)
+        # -------------------------
+        override_applied = False
+        if role == "SUPPORT" and role_confidence >= 0.6:
+            # SUPPORT inventions (monitoring, logging, UI) are rarely pure software
+            # cores — soften the force_mode to avoid over-biasing Phase 2 search.
+            if force_mode == "FORCE_SOFTWARE_CORE":
+                force_mode = "HYBRID_INVENTION"
+                override_applied = True
+                logger.info(
+                    "TCR override: SUPPORT role (conf=%.2f) → downgraded "
+                    "FORCE_SOFTWARE_CORE to HYBRID_INVENTION",
+                    role_confidence,
+                )
+        elif role == "APPLICATION" and role_confidence >= 0.6:
+            # APPLICATION inventions apply tech to a domain — domain context matters,
+            # so a pure software force is too strong.
+            if force_mode == "FORCE_SOFTWARE_CORE" and tcr_bias < 0.95:
+                force_mode = "HYBRID_INVENTION"
+                override_applied = True
+                logger.info(
+                    "TCR override: APPLICATION role (conf=%.2f, bias=%.2f) → "
+                    "downgraded FORCE_SOFTWARE_CORE to HYBRID_INVENTION",
+                    role_confidence,
+                    tcr_bias,
+                )
+
+        # -------------------------
+        # DETERMINISTIC OUTPUT
+        # -------------------------
+
+        return {
+            # Core TCR metrics
             "tcr": round(tcr, 3),
-            "force_flag": force_flag,
-            "computational_weight": round(computational_weight, 2),
-            "physical_weight": round(physical_weight, 2),
-            "computational_term_count": len(computational_terms),
-            "physical_term_count": len(physical_terms),
-            "computational_terms": computational_terms,
-            "physical_terms": physical_terms,
-            "drawing_terms": drawing_terms,
-            "drawing_multiplier_applied": len(drawing_terms) > 0,
-            "analysis_details": analysis_details,
+            "tcr_bias": round(tcr_bias, 3),
+            # Force mode
+            "force_mode": force_mode,
+            # Component scores
+            "computational_score": round(comp_score, 2),
+            "physical_score": round(phys_score, 2),
+            # Confidence
+            "confidence": confidence,
+            # Override tracking
+            "override_applied": override_applied,
+            # Detailed breakdown (for debugging)
+            "computational_terms": comp_terms,
+            "physical_terms": phys_terms,
+            # Term counts (for debugging)
+            "comp_term_count": len(comp_terms),
+            "phys_term_count": len(phys_terms),
+            # Legacy alias removed in v3.0 — use force_mode exclusively
             "dominant_bucket": "computational"
-            if computational_weight > physical_weight
+            if comp_score >= phys_score
             else "physical",
+            "analysis_mode": "stable_rule_based_v2.2",
         }
 
-        logger.info(
-            "Technical Weight Analysis: TCR=%.3f, Flag=%s, Comp=%.2f, Phys=%.2f",
-            tcr,
-            force_flag,
-            computational_weight,
-            physical_weight,
+    # -------------------------
+    # HELPERS
+    # -------------------------
+
+    def _extract_claims_terms(self, phase1_data: Dict[str, Any]) -> List[str]:
+        """Extract individual terms from raw claims text."""
+        claims_terms: List[str] = []
+        claims_text = (
+            phase1_data.get("claims_text", "")
+            or phase1_data.get("labeled_claims", "")
+            or ""
+        )
+        if not claims_text:
+            return claims_terms
+        # Strip claim labels
+        claims_clean = re.sub(r"\[(INDEPENDENT|DEPENDENT[^\]]*)\]", "", claims_text)
+        # Split into individual words/phrases
+        parts = re.split(r'[,;.\n"()\[\]{}]+', claims_clean)
+        for p in parts:
+            p = p.strip().lower()
+            words = p.split()
+            # Reject full sentences (more than 6 words) — single vocabulary terms only
+            if 2 < len(p) and len(words) <= 6:
+                claims_terms.append(p)
+        return claims_terms
+
+    def _extract_terms(self, phase1_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract terms from multiple possible Phase 1 keys."""
+        # 1. Base terms
+        terms = (
+            phase1_data.get("terms", []) or phase1_data.get("essential_terms", []) or []
         )
 
-        return result
+        # 2. Evidence Table (Fix 1)
+        evidence_table = phase1_data.get("evidence_table", [])
+        if evidence_table:
+            for row in evidence_table:
+                if isinstance(row, dict) and row.get("term"):
+                    terms.append({
+                        "term": row["term"],
+                        "importance": row.get("weight", 5)
+                    })
 
-    def _extract_section_text(
-        self, phase1_data: Dict[str, Any], section_type: str
-    ) -> str:
-        """Extract text from specific section of Phase 1 data."""
-        parts = []
+        # 3. CPC Terms (Fix 2)
+        cpc_terms = phase1_data.get("cpc_terms", [])
+        if cpc_terms:
+            for ct in cpc_terms:
+                if isinstance(ct, str):
+                    terms.append({"term": ct, "importance": 7})
 
-        # Check terms for section source
-        terms = phase1_data.get("terms", phase1_data.get("essential_terms", []))
-        for term_info in terms:
-            section = term_info.get("source_section", "").lower()
-            if section_type in section:
-                term = term_info.get("term", "")
-                if term:
-                    parts.append(term)
+        # 4. Core Function Generalized (Fix 3)
+        generalized_fns = phase1_data.get("core_function_generalized", [])
+        if generalized_fns:
+            for gfn in generalized_fns:
+                if isinstance(gfn, str):
+                    # Split into sub-parts (max 4 words each) for wider matching
+                    parts = re.split(r"[,;.\n]", gfn)
+                    for p in parts:
+                        p = p.strip()
+                        if p and len(p) > 3:
+                            terms.append({"term": p, "importance": 8})
 
-        return " ".join(parts)
+        # 5. Disambiguated terms fallback
+        if not terms:
+            disamb = phase1_data.get("disambiguated_terms", [])
+            if disamb:
+                terms = [
+                    {"term": d.get("term", ""), "importance": 7}
+                    for d in disamb
+                    if d.get("term")
+                ]
 
-    def _extract_all_terms(self, phase1_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract all terms from Phase 1 data with importance and source."""
-        terms = phase1_data.get("terms", phase1_data.get("essential_terms", []))
+        cleaned = []
+        seen = set()
+        for t in terms:
+            if isinstance(t, dict):
+                term_text = t.get("term", "").strip().lower()
+                importance = t.get("importance", t.get("weight", 5))
+                if term_text and len(term_text) > 2 and term_text not in seen:
+                    seen.add(term_text)
+                    cleaned.append(
+                        {
+                            "term": t.get("term", "").strip(),
+                            "importance": importance
+                            if isinstance(importance, (int, float))
+                            else 5,
+                        }
+                    )
+        return cleaned
 
-        result = []
-        for term_info in terms:
-            if isinstance(term_info, dict):
-                result.append(
-                    {
-                        "term": term_info.get("term", ""),
-                        "importance": term_info.get("importance", 5),
-                        "source_section": term_info.get(
-                            "source_section", term_info.get("source", "unknown")
-                        ),
-                    }
-                )
-            else:
-                result.append(
-                    {
-                        "term": str(term_info),
-                        "importance": 5,
-                        "source_section": "unknown",
-                    }
-                )
-
-        return result
-
-    def _matches_keywords(self, term: str, keyword_set: set) -> bool:
-        """Check if term matches any keyword in the set."""
-        term = term.lower()
-        for keyword in keyword_set:
-            if keyword in term or term in keyword:
+    def _match(self, term: str, patterns: List[re.Pattern]) -> bool:
+        """Match term against pre-compiled word-boundary patterns."""
+        for pattern in patterns:
+            if pattern.search(term):
                 return True
         return False
 
-    def _count_terms(self, terms: List[Dict], section_type: str) -> int:
-        """Count terms from specific section type."""
-        count = 0
-        for t in terms:
-            if section_type in t.get("section", "").lower():
-                count += 1
-        return count
 
-    def _determine_force_flag(self, tcr: float) -> str:
-        """Determine the force flag based on TCR."""
-        if tcr > 2.0:
-            return "FORCE_SOFTWARE_CORE"
-        elif tcr < 0.5:
-            return "FORCE_DOMAIN_CORE"
-        else:
-            return "HYBRID_INVENTION"
-
-    def get_recommendation(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Get CPC classification recommendation based on TCR analysis.
-
-        Returns guidance for how to weight CPC families.
-        """
-        tcr = result.get("tcr", 1.0)
-        force_flag = result.get("force_flag", "HYBRID_INVENTION")
-        dominant = result.get("dominant_bucket", "computational")
-
-        recommendations = {
-            "primary_core_priority": [],
-            "secondary_core_priority": [],
-            "deprioritize": [],
-        }
-
-        if force_flag == "FORCE_SOFTWARE_CORE":
-            recommendations["primary_core_priority"] = ["G06F", "G06N", "G06K", "G06Q"]
-            recommendations["secondary_core_priority"] = ["G05B", "G10L"]
-            recommendations["deprioritize"] = ["A61", "B23", "F16", "C08"]
-        elif force_flag == "FORCE_DOMAIN_CORE":
-            recommendations["primary_core_priority"] = [
-                "A61",
-                "B23",
-                "B60",
-                "F16",
-                "C08",
-                "E21",
-            ]
-            recommendations["secondary_core_priority"] = ["G06F", "G05B"]
-            recommendations["deprioritize"] = ["G06N"]
-        else:  # HYBRID_INVENTION
-            recommendations["primary_core_priority"] = [
-                "G06F",
-                "G06N",
-                dominant.upper(),
-            ]
-            recommendations["secondary_core_priority"] = ["G05B", "G10L"]
-            recommendations["deprioritize"] = []
-
-        recommendations["dominant_bucket"] = dominant
-        recommendations["force_flag"] = force_flag
-        recommendations["tcr"] = tcr
-
-        return recommendations
+# =========================
+# PUBLIC API
+# =========================
 
 
 def apply_technical_weight_analysis(
     phase1_data: Dict[str, Any],
+    phase1_5_result: Optional[Dict[str, Any]] = None,
+    domain_signals: Optional[List[Dict[str, Any]]] = None,
     analyzer: Optional[TechnicalWeightAnalyzer] = None,
 ) -> Dict[str, Any]:
-    """
-    Quick function to apply technical weight analysis.
-
-    Args:
-        phase1_data: Output from Phase 1
-        analyzer: Optional pre-configured analyzer
-
-    Returns:
-        Analysis result with TCR and force flag
-    """
+    """Public API for TCR analysis."""
     if analyzer is None:
         analyzer = TechnicalWeightAnalyzer()
-    return analyzer.analyze(phase1_data)
+
+    return analyzer.analyze(
+        phase1_data,
+        phase1_5_result=phase1_5_result,
+        domain_signals=domain_signals,
+    )

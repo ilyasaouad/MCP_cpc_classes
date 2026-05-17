@@ -17,9 +17,10 @@ st.set_page_config(
 # -----------------------------
 PHASES = [
     "Phase 1: Semantic Extraction",
+    "Phase 1.2: Forensic Claims Audit",
     "Phase 1.5: Role Classification",
     "TCR: Technical Weight Analysis",
-    "Phase 2A: Layer Decomposition",
+    "Phase 2A v2: CPC Decision",
     "Phase 2B: XML Expansion",
     "Phase 2C: Hybrid Scoring",
     "Phase 2D: Subclass Anchor",
@@ -31,7 +32,10 @@ PHASES = [
     "Phase 8: Role Labeling & Report",
 ]
 
-if "current_phase" not in st.session_state:
+if (
+    "current_phase" not in st.session_state
+    or st.session_state["current_phase"] not in PHASES
+):
     st.session_state["current_phase"] = PHASES[0]
 if "classification_result" not in st.session_state:
     st.session_state["classification_result"] = None
@@ -340,6 +344,23 @@ if phase == "Phase 1: Semantic Extraction":
         st.warning("Phase 1 data not available.")
         st.stop()
 
+    # ── Completeness Status (new) ──
+    p1_status = phase1.get("phase1_status", "MISSING")
+    p1_score = phase1.get("phase1_score", "MISSING")
+    if p1_status != "MISSING":
+        status_color = (
+            "success"
+            if p1_status == "PASS"
+            else "warning"
+            if p1_status == "WARN"
+            else "error"
+        )
+        getattr(st, status_color)(
+            f"**Phase 1 Status: {p1_status}** (Score: {p1_score}/100)"
+        )
+    else:
+        st.caption("_Phase 1 completeness status not available_")
+
     col_obj, col_prob = st.columns(2)
     with col_obj:
         st.markdown("**Technical Object of the Invention:**")
@@ -382,9 +403,11 @@ if phase == "Phase 1: Semantic Extraction":
     if domain_signals:
         for ds in domain_signals[:5]:
             if isinstance(ds, dict):
-                name = ds.get("name", "")
+                name = ds.get("label") or ds.get("name", "")
+                cpc = ds.get("cpc_family", "")
                 conf = ds.get("confidence", 0)
-                st.write(f"- **{name}** (confidence: {conf:.2f})")
+                role = ds.get("role", "")
+                st.write(f"- **{name}** `{cpc}` (confidence: {conf:.2f}, role: {role})")
     else:
         st.write("No domain signals extracted")
 
@@ -419,7 +442,44 @@ if phase == "Phase 1: Semantic Extraction":
     st.markdown("---")
     strategy = phase1.get("classification_strategy", "")
     if strategy:
-        st.markdown(f"**[CHART] Classification Strategy:** `{strategy}`")
+        if isinstance(strategy, dict):
+            strat_type = strategy.get("strategy", "unknown")
+            primary = strategy.get("primary_family", "")
+            secondary = strategy.get("secondary_family") or "None"
+            anchor_split = strategy.get("anchor_split", [1.0, 0.0])
+            reconstructed = strategy.get("reconstructed", False)
+            st.markdown(
+                f"**[CHART] Classification Strategy:** `{strat_type}` | "
+                f"Primary: `{primary}` | Secondary: `{secondary}` | "
+                f"Anchor Split: `{anchor_split}`"
+            )
+            if reconstructed:
+                st.caption(
+                    f"⚠ Reconstructed from domain signals — "
+                    f"{strategy.get('reason', 'LLM did not emit strategy block')}"
+                )
+        else:
+            st.markdown(f"**[CHART] Classification Strategy:** `{strategy}`")
+
+    # Evidence Table (if present)
+    evidence_table = phase1.get("evidence_table", [])
+    if evidence_table:
+        st.markdown("---")
+        st.markdown("**[EVIDENCE] Evidence Table:**")
+        df_evidence = pd.DataFrame(evidence_table)
+        st.dataframe(
+            df_evidence,
+            use_container_width=True,
+            column_config={
+                "term": st.column_config.TextColumn("Term", width="medium"),
+                "weight": st.column_config.NumberColumn("Weight", width="small"),
+                "justification": st.column_config.TextColumn(
+                    "Justification", width="large"
+                ),
+                "source": st.column_config.TextColumn("Source", width="small"),
+                "citation": st.column_config.TextColumn("Citation", width="large"),
+            },
+        )
 
     terms = phase1.get("essential_terms", phase1.get("terms", []))
     if terms:
@@ -447,228 +507,375 @@ if phase == "Phase 1: Semantic Extraction":
         st.write("No terms extracted")
 
 # =============================================================================
-# PHASE 1.5: Invention Role Classification
+# PHASE 1.2: Forensic Claims Audit
+# =============================================================================
+elif phase == "Phase 1.2: Forensic Claims Audit":
+    phase1_2 = result.get("phase1_2", {})
+
+    st.divider()
+    st.subheader("[LEGAL GATE] Phase 1.2 — Mandatory Forensic Claims Audit")
+    st.caption(
+        "Method: Validates Phase 1 domain signals against actual claims text. "
+        "First time claims are analyzed in the pipeline."
+    )
+
+    if not phase1_2:
+        st.warning("Phase 1.2 results not available.")
+        st.stop()
+
+    # Audit status
+    audit_status = phase1_2.get("audit_status", "UNKNOWN")
+    if audit_status == "SUCCESS":
+        st.success(f"**Audit Status: {audit_status}**")
+    elif audit_status == "PARTIAL":
+        st.warning(f"**Audit Status: {audit_status}**")
+    else:
+        st.error(f"**Audit Status: {audit_status}**")
+
+    # Primary anchor
+    primary_anchor = phase1_2.get("final_primary_anchor", "")
+    if primary_anchor:
+        st.markdown(f"**Final Primary Anchor:** `{primary_anchor}`")
+
+    # Secondary anchors
+    secondary_anchors = phase1_2.get("secondary_anchors", [])
+    if secondary_anchors:
+        st.markdown(
+            f"**Secondary Anchors:** {', '.join(f'`{a}`' for a in secondary_anchors)}"
+        )
+
+    # Domain signal validation
+    st.markdown("---")
+    st.markdown("**Domain Signal Validation:**")
+    validations = phase1_2.get("signal_validations", [])
+    if validations:
+        for v in validations[:10]:
+            if isinstance(v, dict):
+                domain = v.get("domain", v.get("signal", "?"))
+                cpc = v.get("cpc_family", "?")
+                status = v.get("status", "unknown")
+                reason = v.get("reason", "")
+                evidence = v.get("claims_evidence", "")
+
+                if status == "validated":
+                    st.markdown(f"- ✅ `{domain}` `{cpc}` — {reason}")
+                elif status == "rejected":
+                    st.markdown(f"- ❌ `{domain}` `{cpc}` — {reason}")
+                elif status == "downgraded":
+                    st.markdown(f"- ⚠️ `{domain}` `{cpc}` — {reason}")
+                else:
+                    st.markdown(f"- ❓ `{domain}` `{cpc}` — {status}: {reason}")
+
+                if evidence:
+                    st.caption(f"  *Evidence: {evidence[:150]}...*")
+    else:
+        st.caption("No signal validation details available")
+
+    # Conflict resolution
+    conflicts = phase1_2.get("conflicts_detected", [])
+    if conflicts:
+        st.markdown("---")
+        st.markdown("**Conflicts Detected:**")
+        for c in conflicts:
+            if isinstance(c, dict):
+                st.warning(f"- {c.get('description', str(c))}")
+
+    # Rejected domains
+    rejected = phase1_2.get("rejected_domains", [])
+    if rejected:
+        st.markdown("---")
+        st.markdown("**Rejected Domains:**")
+        for r in rejected:
+            if isinstance(r, dict):
+                st.markdown(f"- ❌ `{r.get('domain', '?')}` — {r.get('reason', '')}")
+            elif isinstance(r, str):
+                st.markdown(f"- ❌ {r}")
+
+    # Reasoning
+    reasoning = phase1_2.get("audit_reasoning", "")
+    if reasoning:
+        st.markdown("---")
+        st.markdown("**Audit Reasoning:**")
+        st.caption(reasoning)
+
+    # Raw JSON
+    with st.expander("[DEBUG] Raw Phase 1.2 JSON"):
+        st.json(phase1_2)
+
+# =============================================================================
+# PHASE 1.5: Invention Role Classification + TCR (COMBINED)
 # =============================================================================
 elif phase == "Phase 1.5: Role Classification":
     phase15 = result.get("phase15", {})
-    if phase15:
-        st.divider()
-        st.subheader("[TARGET] Phase 1.5 — Invention Role Classification")
-        st.caption(
-            "Method: LLM-based role classification (CORE_TECH / SYSTEM / APPLICATION / SUPPORT)"
-        )
-
-        role = phase15.get("role", "UNKNOWN")
-        confidence = phase15.get("confidence", 0)
-
-        role_colors = {
-            "CORE_TECH": "success",
-            "SYSTEM": "info",
-            "APPLICATION": "warning",
-            "SUPPORT": "secondary",
-        }
-        role_color = role_colors.get(role, "info")
-
-        col_role, col_conf = st.columns(2)
-        with col_role:
-            if role_color == "success":
-                st.success(f"**{role}** — Core Technical Innovation")
-            elif role_color == "info":
-                st.info(f"**{role}** — System Orchestration")
-            elif role_color == "warning":
-                st.warning(f"**{role}** — Domain Application")
-            else:
-                st.info(f"**{role}** — Auxiliary Support")
-            st.caption("Primary classification driver")
-        with col_conf:
-            st.metric("Confidence", f"{confidence:.2f}")
-
-        role_descriptions = {
-            "CORE_TECH": "The invention modifies/improves the underlying technology itself (algorithms, model architecture, training methods)",
-            "SYSTEM": "The invention orchestrates/coordinates/manages components (pipelines, multi-component systems, data/control flow)",
-            "APPLICATION": "The invention applies known technology to a specific domain (medical, automotive, finance, industry-specific)",
-            "SUPPORT": "Auxiliary functionality not central to technical operation (logging, storage, UI, monitoring)",
-        }
-        st.markdown(
-            f"**Role Definition:** {role_descriptions.get(role, 'Unknown role')}"
-        )
-
-        reasoning = phase15.get("reasoning", [])
-        if reasoning:
-            st.markdown("**Reasoning:**")
-            for r in reasoning:
-                st.write(f"- {r}")
-
-        evidence = phase15.get("evidence", [])
-        if evidence:
-            with st.expander("[INFO] Evidence"):
-                for e in evidence:
-                    st.write(f"- {e}")
-
-        st.markdown("---")
-        st.markdown("**CPC Routing Implications:**")
-        if role == "CORE_TECH":
-            st.markdown("→ Boost: G06N, G06T, G06V, G10L (technology-native classes)")
-            st.markdown("→ Deprioritize: G06F, H04L (unless strongly supported)")
-        elif role == "SYSTEM":
-            st.markdown("→ Boost: G06F, H04L, G05B (system orchestration classes)")
-            st.markdown(
-                "→ Deprioritize: G06N, G06T (unless NN-internal signals present)"
-            )
-        elif role == "APPLICATION":
-            st.markdown("→ Boost: A61, B60, B23, E21, A01 (domain-specific classes)")
-            st.markdown("→ Deprioritize: G06N (AI is tool, not subject)")
-        else:
-            st.markdown("→ Boost: G06F (general computing for auxiliary functions)")
-    else:
-        st.warning("Phase 1.5 results not available.")
-
-# =============================================================================
-# TCR: Technical Weight Analysis
-# =============================================================================
-elif phase == "TCR: Technical Weight Analysis":
     tcr_result = result.get("tcr_analysis", {})
+
+    st.divider()
+    st.subheader("[TARGET] Phase 1.5 — Invention Role Classification + TCR")
+    st.caption(
+        "Method: Structural pattern labelling (CORE_TECH / SYSTEM / APPLICATION / SUPPORT) "
+        "+ Technical Character Ratio analysis"
+    )
+
+    if not phase15:
+        st.warning("Phase 1.5 results not available.")
+        st.stop()
+
+    # ── Role Classification ──
+    role = phase15.get("role", "UNKNOWN")
+    confidence = phase15.get("confidence", 0)
+    reasoning = phase15.get("reasoning", "")
+
+    ROLE_UI_MAP = {
+        "CORE_TECH": {"label": "Internal Mechanism Focus", "color": "success"},
+        "SYSTEM": {"label": "Multi-Component System", "color": "info"},
+        "APPLICATION": {"label": "Application Context", "color": "warning"},
+        "SUPPORT": {"label": "Supporting Function", "color": "secondary"},
+    }
+    ui = ROLE_UI_MAP.get(role, {"label": role, "color": "info"})
+
+    col_role, col_conf = st.columns(2)
+    with col_role:
+        fn = getattr(st, ui["color"], st.info)
+        fn(f"**{ui['label']}**")
+        st.caption(f"Raw role: {role}")
+    with col_conf:
+        st.metric("Role Confidence", f"{confidence:.2f}")
+
+    if reasoning:
+        st.caption(f"*{reasoning}*")
+
+    st.markdown("---")
+
+    # ── TCR Analysis (shown inline) ──
+    st.markdown("#### Technical Character Ratio (TCR)")
+    st.caption(
+        "Soft bias signal — measures computational vs physical term density in the invention"
+    )
+
     if tcr_result:
-        st.divider()
-        st.subheader("[NEW] Technical Weight Analysis")
-        st.caption(
-            "Determines whether invention is primarily computational (software) or physical (domain-specific)"
-        )
-
         tcr = tcr_result.get("tcr", 1.0)
-        force_flag = tcr_result.get("force_flag", "HYBRID_INVENTION")
-        comp_weight = tcr_result.get("computational_weight", 0)
-        phys_weight = tcr_result.get("physical_weight", 0)
-        dominant = tcr_result.get("dominant_bucket", "unknown")
+        tcr_bias = tcr_result.get("tcr_bias", 0.0)
+        tcr_conf = tcr_result.get("confidence", 0.0)
+        comp_score = tcr_result.get("computational_score", 0)
+        phys_score = tcr_result.get("physical_score", 0)
+        force_mode = tcr_result.get("force_mode", "UNKNOWN")
+        override = tcr_result.get("override_applied", False)
 
-        col_tcr1, col_tcr2, col_tcr3 = st.columns(3)
-        with col_tcr1:
-            st.metric("TCR (Technical Character Ratio)", f"{tcr:.3f}")
-        with col_tcr2:
-            flag_emoji = (
-                "🖥️"
-                if force_flag == "FORCE_SOFTWARE_CORE"
-                else "⚙️"
-                if force_flag == "FORCE_DOMAIN_CORE"
-                else "🔄"
-            )
-            st.metric("Force Flag", f"{flag_emoji} {force_flag}")
-        with col_tcr3:
-            st.metric("Dominant Bucket", dominant.capitalize())
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("TCR Ratio", f"{tcr:.3f}")
+        with col2:
+            st.metric("TCR Bias", f"{tcr_bias:+.3f}")
+        with col3:
+            st.metric("TCR Confidence", f"{tcr_conf:.0%}")
 
-        if force_flag == "FORCE_SOFTWARE_CORE":
-            st.info(
-                "🖥️ **Interpretation:** Computationally dominant (TCR > 2.0). Primary CPC: G06F/G06N. Physical codes = CONTEXT/SUPPORT only."
-            )
-        elif force_flag == "FORCE_DOMAIN_CORE":
-            st.info(
-                "⚙️ **Interpretation:** Physically dominant (TCR < 0.5). Primary CPC: domain-specific. Computational codes = SUPPORT only."
-            )
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Computational", f"{comp_score:.1f}")
+        with col2:
+            st.metric("Physical", f"{phys_score:.1f}")
+
+        st.caption(f"**Force Mode:** `{force_mode}`")
+
+        # Bias interpretation
+        if tcr_bias > 0.3:
+            st.info("📊 **Computational leaning** — software/AI methodology dominant")
+        elif tcr_bias < -0.3:
+            st.info("📊 **Physical leaning** — hardware/domain physicality dominant")
         else:
-            st.info(
-                "🔄 **Interpretation:** Hybrid invention (0.5 <= TCR <= 2.0). Both layers contribute meaningfully."
-            )
+            st.info("📊 **Balanced** — hybrid invention, no strong bias")
 
+        # Matched terms
         comp_terms = tcr_result.get("computational_terms", [])
         phys_terms = tcr_result.get("physical_terms", [])
 
-        col_terms1, col_terms2 = st.columns(2)
-        with col_terms1:
-            if comp_terms:
-                st.markdown(f"**Computational Terms ({len(comp_terms)}):**")
-                terms_list = [t.get("term", "") for t in comp_terms[:15]]
-                st.write(
-                    ", ".join(terms_list) + ("..." if len(comp_terms) > 15 else "")
-                )
-        with col_terms2:
-            if phys_terms:
-                st.markdown(f"**Physical/Domain Terms ({len(phys_terms)}):**")
-                terms_list = [t.get("term", "") for t in phys_terms[:15]]
-                st.write(
-                    ", ".join(terms_list) + ("..." if len(phys_terms) > 15 else "")
-                )
-    else:
-        st.warning("TCR analysis not available.")
+        if comp_terms or phys_terms:
+            with st.expander("Show matched terms"):
+                if comp_terms:
+                    st.markdown(
+                        f"**Computational ({len(comp_terms)}):** {', '.join(comp_terms[:15])}"
+                        + ("..." if len(comp_terms) > 15 else "")
+                    )
+                if phys_terms:
+                    st.markdown(
+                        f"**Physical ({len(phys_terms)}):** {', '.join(phys_terms[:15])}"
+                        + ("..." if len(phys_terms) > 15 else "")
+                    )
+                if not comp_terms and not phys_terms:
+                    st.caption("No terms matched either category")
+        else:
+            st.caption("No term matches recorded")
 
-# =============================================================================
-# PHASE 2A: Layer Decomposition
-# =============================================================================
-elif phase == "Phase 2A: Layer Decomposition":
-    phase2a_layers = result.get("phase2a_layers", {})
-    if phase2a_layers:
-        st.divider()
-        st.subheader("[LAYERS] Phase 2A — CPC Layer Decomposition")
-        st.caption(
-            "Multi-layer decomposition: each technical layer independently maps to CPC. "
-            "NO cross-layer penalties. NO forced hierarchy."
-        )
-
-        primary_layer = phase2a_layers.get("primary_layer", "unknown")
-        layer_scores = phase2a_layers.get("layer_scores", {})
-        layers = phase2a_layers.get("layers", {})
-        relationships = phase2a_layers.get("relationships", {})
-        ai_role = phase2a_layers.get("ai_role", "unknown")
-
-        col_primary, col_ai = st.columns(2)
-        with col_primary:
-            st.metric("Primary Layer", primary_layer.upper())
-        with col_ai:
-            st.metric("AI Role", ai_role)
-
-        if layer_scores:
-            st.markdown("**Layer Scores:**")
-            score_df = pd.DataFrame(
-                [{"Layer": k, "Score": v} for k, v in layer_scores.items()]
+        # Warning if fallback
+        if tcr_conf == 0.0 and tcr == 1.0:
+            st.error(
+                "⚠️ **TCR is using fallback values** — "
+                "`TechnicalWeightAnalyzer.analyze()` likely failed. Check backend logs."
             )
-            st.bar_chart(score_df.set_index("Layer"))
-
-        st.markdown("---")
-        st.markdown("**Technical Layers & CPC Candidates:**")
-
-        layer_names = {
-            "application": "Application (What system is FOR)",
-            "data_reasoning": "Data & Reasoning (How knowledge is represented)",
-            "interaction": "Interaction (User/System interface)",
-            "control": "Control (System orchestration logic)",
-        }
-
-        for layer_name, layer_candidates in layers.items():
-            if layer_candidates:
-                with st.expander(
-                    f"[{'PRIMARY' if layer_name == primary_layer else 'LAYER'}] {layer_names.get(layer_name, layer_name)}",
-                    expanded=(layer_name == primary_layer),
-                ):
-                    st.markdown(f"**Score:** {layer_scores.get(layer_name, 0):.2f}")
-                    st.markdown("**CPC Candidates:**")
-                    for cand in layer_candidates[:5]:
-                        st.code(f"{cand['symbol']} ({cand.get('type', 'family')})")
-                    rels = relationships.get(layer_name, [])
-                    if rels:
-                        st.markdown("**Relationships:**")
-                        for rel in rels:
-                            st.write(f"- {rel}")
-
-        st.markdown("---")
-        st.info(
-            "**Multi-Layer Principle:** Each layer maps to CPC independently. "
-            "A vehicle speech control patent should have: B60W (control) + G10L (speech) + "
-            "G06F (data/NLP) + G05B (orchestration) — NOT collapsed to a single family."
-        )
     else:
-        st.warning("Phase 2A results not available.")
-        # Fallback to legacy Phase 2A display
-        phase2 = result.get("phase2", {})
-        if phase2 and phase2.get("phase2a_families"):
-            st.subheader("[FALLBACK] Legacy Phase 2A — CPC Family Router")
-            col_fam, col_prim, col_mod = st.columns(3)
-            with col_fam:
-                st.markdown("**Selected Families:**")
-                for fam in phase2.get("phase2a_families", [])[:5]:
-                    st.code(fam)
-            with col_prim:
-                st.metric("Primary Family", phase2.get("phase2a_primary", "N/A"))
-            with col_mod:
-                st.metric("Modality", phase2.get("phase2a_modality", "unknown"))
+        st.warning("TCR analysis not available in response.")
+
+    # ── Raw JSON Debug ──
+    st.markdown("---")
+    with st.expander("[DEBUG] Raw Phase 1.5 + TCR JSON"):
+        st.json(
+            {
+                "phase15": phase15,
+                "tcr_analysis": tcr_result,
+            }
+        )
+
+# =============================================================================
+# TCR: Technical Weight Analysis (DETAILED VIEW)
+# =============================================================================
+elif phase == "TCR: Technical Weight Analysis":
+    tcr_result = result.get("tcr_analysis", {})
+
+    st.divider()
+    st.subheader("Technical Weight Analysis")
+    st.caption(
+        "Soft bias signal — non-authoritative. Measures computational vs physical term density."
+    )
+
+    if not tcr_result:
+        st.warning("TCR analysis not available.")
+        with st.expander("[DEBUG] Check response keys"):
+            st.json(
+                {
+                    "available_keys": list(result.keys()),
+                    "has_tcr_analysis": "tcr_analysis" in result,
+                    "tcr_analysis_value": result.get("tcr_analysis"),
+                }
+            )
+        st.stop()
+
+    tcr = tcr_result.get("tcr", 1.0)
+    tcr_bias = tcr_result.get("tcr_bias", 0.0)
+    confidence = tcr_result.get("confidence", 0.0)
+    comp_weight = tcr_result.get("computational_score", 0)
+    phys_weight = tcr_result.get("physical_score", 0)
+    force_mode = tcr_result.get("force_mode", "UNKNOWN")
+    override = tcr_result.get("override_applied", False)
+    dominant = tcr_result.get("dominant_bucket", "unknown")
+    analysis_mode = tcr_result.get("analysis_mode", "unknown")
+
+    col_tcr1, col_tcr2, col_tcr3 = st.columns(3)
+    with col_tcr1:
+        st.metric("TCR Ratio", f"{tcr:.3f}")
+    with col_tcr2:
+        st.metric("Bias", f"{tcr_bias:+.3f}")
+    with col_tcr3:
+        st.metric("Match Confidence", f"{confidence:.0%}")
+
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        st.metric("Comp Score", f"{comp_weight:.2f}")
+    with col_s2:
+        st.metric("Phys Score", f"{phys_weight:.2f}")
+
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Force Mode", force_mode)
+    with col2:
+        st.metric("Dominant", dominant)
+    with col3:
+        st.metric("Override Applied", "Yes" if override else "No")
+
+    # Bias interpretation — accounts for both magnitude and force mode
+    if force_mode == "FORCE_SOFTWARE_CORE" or tcr_bias >= 0.9:
+        st.success("**Strong computational dominance** — software/AI core confirmed (FORCE_SOFTWARE_CORE active)")
+    elif force_mode == "FORCE_DOMAIN_CORE" or tcr_bias <= -0.9:
+        st.success("**Strong physical/domain dominance** — hardware/domain core confirmed (FORCE_DOMAIN_CORE active)")
+    elif tcr_bias >= 0.5:
+        st.info("**Moderate–strong computational leaning** — ranking bias applied toward software/AI families")
+    elif tcr_bias <= -0.5:
+        st.info("**Moderate–strong physical leaning** — ranking bias applied toward domain/hardware families")
+    elif tcr_bias > 0.15:
+        st.caption("Slight computational leaning — minimal ranking bias")
+    elif tcr_bias < -0.15:
+        st.caption("Slight physical/domain leaning — minimal ranking bias")
+    else:
+        st.caption("Balanced — no bias applied")
+
+    # Matched terms
+    comp_terms = tcr_result.get("computational_terms", [])
+    phys_terms = tcr_result.get("physical_terms", [])
+
+    col_terms1, col_terms2 = st.columns(2)
+    with col_terms1:
+        if comp_terms:
+            st.markdown(f"**Computational Terms ({len(comp_terms)}):**")
+            st.write(
+                ", ".join(comp_terms[:15]) + ("..." if len(comp_terms) > 15 else "")
+            )
+        else:
+            st.markdown("**Computational Terms:** (none matched)")
+    with col_terms2:
+        if phys_terms:
+            st.markdown(f"**Physical/Domain Terms ({len(phys_terms)}):**")
+            st.write(
+                ", ".join(phys_terms[:15]) + ("..." if len(phys_terms) > 15 else "")
+            )
+        else:
+            st.markdown("**Physical/Domain Terms:** (none matched)")
+
+    # Fallback warning
+    if confidence == 0.0 and tcr == 1.0:
+        st.error(
+            "⚠️ **TCR is using fallback values** — "
+            "`TechnicalWeightAnalyzer.analyze()` likely failed."
+        )
+
+    # Analysis mode
+    st.caption(f"Analysis mode: `{analysis_mode}`")
+
+    # Debug
+    with st.expander("[DEBUG] Raw TCR JSON"):
+        st.json(tcr_result)
+
+# =============================================================================
+# PHASE 2A V2: CPC DECISION (AUTHORITATIVE)
+# =============================================================================
+elif phase == "Phase 2A v2: CPC Decision":
+    st.divider()
+    st.subheader("\u2714 Final CPC Decision (Phase 2A v2)")
+    phase2 = result.get("phase2", {})
+    phase2a_v2 = phase2.get("phase2a_v2", {})
+    fallback_used = phase2.get("fallback_used", False)
+    cpc_source = phase2.get("cpc_source", "unknown")
+    if fallback_used:
+        st.error("\u26a0 Fallback CPC Selection Used \u2014 Phase 2A v2 failed")
+        st.caption("This is fallback, not primary classification.")
+        families = phase2.get("final_cpc_families", [])
+        if families:
+            st.markdown("**Fallback Families:**")
+            for fam in families:
+                st.code(fam)
+        else:
+            st.warning(
+                "No CPC families available \u2014 pipeline could not produce classification."
+            )
+    elif phase2a_v2.get("families"):
+        st.caption(
+            f"Source: {cpc_source}  |  Fallback: {'Yes' if fallback_used else 'No'}"
+        )
+        families = phase2a_v2["families"]
+        for f in families:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"**{f['family']}**")
+                st.caption(", ".join(f.get("evidence", [])))
+            with col2:
+                st.metric("Score", f"{f['score']:.3f}")
+        debug = phase2a_v2.get("debug", {})
+        if debug:
+            with st.expander("Fusion Evidence Trace"):
+                st.json(debug)
+    elif phase2.get("phase2a_families"):
+        st.info("Using saved CPC families")
+        for fam in phase2.get("phase2a_families", [])[:5]:
+            st.code(fam)
 
 # =============================================================================
 # PHASE 2B: XML Expansion
@@ -676,46 +883,93 @@ elif phase == "Phase 2A: Layer Decomposition":
 elif phase == "Phase 2B: XML Expansion":
     phase2 = result.get("phase2", {})
     st.divider()
-    st.subheader("[CHART] Phase 2B — Restricted XML Expansion")
+    st.subheader("[CHART] Phase 2B — Weighted Hierarchical CPC Expansion")
     st.caption(
-        "Method: CPC XML parser restricted to technical-layer 4‑char subclass prefixes. "
-        "Only subclasses matching Phase 2A technical layers are expanded. "
-        "Application-layer domains (B60, A61, G06Q) are excluded at the source."
+        "Method: Multi-source expansion (KG hierarchy → graph traversal depth 2-3 → XML fallback). "
+        "Each subclass is scored via inheritance (50%) + KG similarity (30%) + embedding (20%). "
+        "Slot allocation is proportional to Phase 2A relevance score — high-relevance families "
+        "receive more search slots than low-relevance ones."
     )
     if phase2:
         count_2b = phase2.get("phase2b_candidate_count", 0)
         expansion_counts = phase2.get("phase2b_expansion_counts", {})
-        skipped = phase2.get("phase2b_skipped_classes", [])
+        family_expansions = phase2.get("phase2b_family_expansions", [])
+        pruned_count = phase2.get("phase2b_pruned_count", 0)
+        expansion_balance = phase2.get("expansion_balance", {})
         families = phase2.get("phase2a_families", [])
+        raw_counts = phase2.get("phase2b_raw_family_counts", {})
+        prop_caps = phase2.get("phase2b_proportional_caps", {})
+        family_scores_2a = {
+            f["family"]: f["score"]
+            for f in phase2.get("phase2a_v2_result", {}).get("families", [])
+        }
 
         st.markdown(
-            "Expands CPC subgroup definitions **only within Phase 2A technical families** "
-            "to reduce search space and prevent non-technical domain leakage."
+            "Expands CPC families into **scored, ranked, and pruned** subgroups. "
+            f"{pruned_count} low-relevance subclasses filtered out (score < 0.30)."
         )
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Expanded Candidates", count_2b)
         with col2:
+            st.metric("Pruned (score < 0.30)", pruned_count)
+        with col3:
             reduction = (
                 f"~{((1 - count_2b / 250000) * 100):.1f}%" if count_2b > 0 else "N/A"
             )
             st.metric("Search Space Reduction", reduction)
 
+        # Proportional scaling table
+        if raw_counts and prop_caps and families:
+            st.markdown("---")
+            st.markdown("**Relevance-proportional slot allocation per family:**")
+            st.caption(
+                "Each family's raw taxonomy count is scaled down proportionally to its "
+                "Phase 2A relevance score. The highest-scoring family keeps its full count "
+                "as reference. Others are capped at: `ref_count × (family_score / ref_score)`. "
+                "This prevents low-relevance families from flooding the search space."
+            )
+
+            # Find reference family (highest Phase 2A score)
+            if family_scores_2a:
+                ref_fam = max(family_scores_2a, key=family_scores_2a.get)
+                ref_score_val = family_scores_2a[ref_fam]
+                ref_raw_val = raw_counts.get(ref_fam, 0)
+            else:
+                ref_fam, ref_score_val, ref_raw_val = "", 0.0, 0
+
+            cols = st.columns(len(families))
+            for i, fam in enumerate(families):
+                raw = raw_counts.get(fam, "—")
+                cap = prop_caps.get(fam, "—")
+                final = expansion_balance.get(fam, "—")
+                score = family_scores_2a.get(fam, 0.0)
+                is_ref = fam == ref_fam
+
+                with cols[i]:
+                    st.markdown(f"**{fam}**")
+                    st.caption(f"Phase 2A score: `{score:.3f}`" + (" (reference)" if is_ref else ""))
+                    st.metric("Raw taxonomy count", raw)
+                    if not is_ref and ref_raw_val > 0 and ref_score_val > 0:
+                        st.caption(
+                            f"Cap = {ref_raw_val} × ({score:.3f} / {ref_score_val:.3f}) = **{cap}**"
+                        )
+                    else:
+                        st.caption("Reference family — no cap applied")
+                    st.metric("After scaling", final, delta=f"{(final - raw) if isinstance(raw, int) and isinstance(final, int) else '—'}")
+
         # Per-family expansion breakdown
         if expansion_counts:
             st.markdown("---")
-            st.markdown("**Subgroups expanded per subclass prefix:**")
+            st.markdown("**Final subgroups per family (after scaling):**")
             count_items = sorted(expansion_counts.items())
             cols = st.columns(min(len(count_items), 4))
             for i, (prefix, cnt) in enumerate(count_items):
                 with cols[i % len(cols)]:
                     st.metric(prefix, cnt)
 
-        if skipped:
-            st.warning(f"Skipped (no XML file): {', '.join(skipped)}")
-
         if families:
-            st.caption(f"Restricted to families: {', '.join(families)}")
+            st.caption(f"Families expanded: {', '.join(families)}")
     else:
         st.warning("Phase 2B data not available.")
 
@@ -727,9 +981,8 @@ elif phase == "Phase 2C: Hybrid Scoring":
     st.divider()
     st.subheader("[CHART] Phase 2C — Hybrid Scoring & Filtering")
     st.caption(
-        "Method: Find‑Until‑Full retrieval — scores ALL expanded candidates with "
-        "hybrid TF‑IDF (bigrams) + embedding similarity (0.4×TF‑IDF + 0.6×Semantic). "
-        "Progressive expansion ensures Phase 2D has enough candidates to reach 20‑survivor quota."
+        "Method: Scores ALL Phase 2B expanded candidates with BM25 (bigrams) + "
+        "embedding similarity, fused via RRF. Phase 2D then keeps the top 50 by score."
     )
     if phase2:
         total_scored = phase2.get(
@@ -740,8 +993,8 @@ elif phase == "Phase 2C: Hybrid Scoring":
         find_until_full = phase2.get("phase2d_find_until_full", [])
 
         st.markdown(
-            "Scores **ALL** expanded candidates. Phase 2D then progressively expands "
-            "(500 → 1000 → all) until ≥ 20 technical anchors survive filtering."
+            "Scores **ALL** expanded candidates. Phase 2D keeps the **top 50** "
+            "by hybrid score for Phase 3 ranking."
         )
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -784,54 +1037,35 @@ elif phase == "Phase 2C: Hybrid Scoring":
 elif phase == "Phase 2D: Subclass Anchor":
     phase2 = result.get("phase2", {})
     st.divider()
-    st.subheader("[ANCHOR] Phase 2D — Subclass Structural Anchor Filter")
+    st.subheader("[FILTER] Phase 2D — Top-N Score Filter")
     st.caption(
-        "Method: Filters Phase 2C candidates — keeps only those whose 4-char CPC subclass prefix "
-        "matches the Phase 2A technical layer anchors (pure_software, data_reasoning, interaction, control). "
-        "Excludes application-layer codes and non-technical families (G06Q, etc.)."
+        "Method: Keeps the top 50 highest-scoring candidates from Phase 2C. "
+        "Eliminates low-confidence subgroups before Phase 3 ranking, giving Phase 3 "
+        "a focused, high-quality input instead of hundreds of diluted candidates."
     )
 
-    anchor_set = phase2.get("phase2d_anchor_set", [])
-    anchor_source = phase2.get("phase2d_anchor_source", [])
     kept_count = phase2.get("phase2d_kept_count", 0)
     discarded_count = phase2.get("phase2d_discarded_count", 0)
     discard_log = phase2.get("phase2d_discard_log", [])
 
-    if anchor_set:
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            st.metric("Anchor Subclasses", len(anchor_set))
-        with col_b:
-            st.metric("Candidates Kept", kept_count)
-        with col_c:
-            st.metric("Candidates Discarded", discarded_count)
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("Candidates Kept (Top 50)", kept_count)
+    with col_b:
+        st.metric("Candidates Discarded", discarded_count)
+    with col_c:
+        total = kept_count + discarded_count
+        reduction = f"~{(discarded_count / total * 100):.1f}%" if total > 0 else "N/A"
+        st.metric("Noise Reduction", reduction)
 
-        st.markdown(f"**Anchor Set:** `{', '.join(anchor_set)}`")
-        st.caption(
-            f"Source layers: {', '.join(anchor_source) if anchor_source else 'family_router'}"
-        )
+    st.markdown("**Filter Rule:** Sort all Phase 2C candidates by score → keep top 50.")
 
-        st.markdown(
-            "**Filter Rule:** Candidate prefix must be in anchor set AND not in excluded families (G06Q, G06C, G07F, G07G, G09F, G09B, A63F)."
-        )
-
-        if discard_log:
-            with st.expander(f"[DEBUG] Discarded Candidates ({len(discard_log)})"):
-                for d in discard_log:
-                    reason_icon = (
-                        "[FAMILY]"
-                        if d.get("reason") == "non_technical_family"
-                        else "[ANCHOR]"
-                        if d.get("reason") == "not_in_anchor_set"
-                        else "[PREFIX]"
-                    )
-                    st.write(
-                        f"{reason_icon} `{d.get('symbol', '?')}` — {d.get('reason', '')}"
-                    )
-    else:
-        st.info(
-            "Phase 2D anchor filter not applied — all candidates passed through unchanged."
-        )
+    if discard_log:
+        with st.expander(f"[DEBUG] Discarded Candidates ({len(discard_log)})"):
+            for d in discard_log[:20]:
+                st.write(f"`{d.get('symbol', '?')}` — {d.get('reason', '')}")
+            if len(discard_log) > 20:
+                st.caption(f"... and {len(discard_log) - 20} more")
 
 # =============================================================================
 # PHASE 3: CPC Subgroup Ranking
@@ -1649,3 +1883,19 @@ if phase4_raw:
 if phase5_raw:
     with st.expander("[DEBUG] Raw Phase 5 JSON"):
         st.json(phase5_raw)
+
+# ── DEBUG: Phase 1.5 + TCR presence check ──
+with st.expander("[DEBUG] Phase 1.5 + TCR presence check"):
+    st.json(
+        {
+            "phase15_exists": "phase15" in result,
+            "phase15_keys": list(result.get("phase15", {}).keys())
+            if result.get("phase15")
+            else [],
+            "tcr_analysis_exists": "tcr_analysis" in result,
+            "tcr_keys": list(result.get("tcr_analysis", {}).keys())
+            if result.get("tcr_analysis")
+            else [],
+            "tcr_value": result.get("tcr_analysis"),
+        }
+    )

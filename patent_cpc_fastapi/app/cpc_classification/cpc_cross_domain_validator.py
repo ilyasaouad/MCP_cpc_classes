@@ -464,10 +464,16 @@ LAYER_DOMAIN_REQUIREMENTS = {
 
 class CrossDomainValidator:
     """
-    Phase 3.6: Cross-Domain Validation Layer.
+    Phase 3.6: Cross-Domain Semantic Validator.
 
-    Prevents domain collapse by validating CPC candidates against
-    actual domain signals and contextual entity consistency.
+    Validates that Phase 3 CPC candidates are semantically consistent with
+    the invention's technical domain as established in Phase 1 and Phase 1.2.
+    Uses Phase 2A layer signals for structural validation.
+
+    All validation is driven by Phase 1/1.2 domain signals, NOT by
+    static heuristic lists. The domain-to-family mappings below are
+    validation reference tables — they describe semantic consistency
+    rules, not routing decisions.
     """
 
     def __init__(self):
