@@ -1,0 +1,26 @@
+# patent_cpc_API — runtime dependencies
+# Install: pip install -r requirements.txt
+
+# ── API framework ─────────────────────────────────────────────
+fastapi
+uvicorn
+pydantic
+
+# ── Config + env ──────────────────────────────────────────────
+python-dotenv
+pyyaml
+
+# ── LLM clients ───────────────────────────────────────────────
+anthropic          # for Claude (Phase 1A, 1B, 5A, 5B)
+ollama             # local LLM fallback
+
+# ── KG + embeddings (only needed if SKIP_KG != 1) ─────────────
+networkx>=3.0
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+rank-bm25
+
+# ── Shared with patent_cpc_fastapi (already in that .venv) ────
+# You can skip re-installing these if you reuse the same venv:
+# fastapi, uvicorn, pydantic, numpy, python-dotenv

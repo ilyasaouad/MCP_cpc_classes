@@ -1,0 +1,32 @@
+MPC server: file AI-projects/MCP_patent_classification:
+
+npm run dev
+
+FastAPI:
+source .venv/Script/activate
+/AI-projects/patent_cpc_fastapi (master)
+
+
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+
+Streamlit:
+
+AI-projects/cpc_client (master)
+source .venv/Script/activate
+
+streamlit run streamlit_app.py
+
+
+─────────────────────────────────────────────────────────────────────
+patent_cpc_API (v2):   AI-projects/MCP_cpc_classes/patent_cpc_API
+─────────────────────────────────────────────────────────────────────
+
+cd patent_cpc_API
+
+.\.venv\Scripts\python.exe run.py
+
+
+Streamlit v2: AI-projects/cpc_client
+
+streamlit run streamlit_app_2.py

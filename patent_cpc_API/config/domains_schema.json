@@ -1,0 +1,94 @@
+{
+  "_comment": "CPC domain mappings. Used by Phase 3A constraints and Phase 2A routing.",
+
+  "domain_to_cpc": {
+    "ai":                  ["G06N"],
+    "machine learning":    ["G06N"],
+    "neural networks":     ["G06N"],
+    "deep learning":       ["G06N"],
+    "general computing":   ["G06F"],
+    "data processing":     ["G06F"],
+    "databases":           ["G06F"],
+    "security":            ["G06F", "H04L"],
+    "cryptography":        ["H04L", "G06F"],
+    "image":               ["G06T"],
+    "image processing":    ["G06T"],
+    "video":               ["G06T"],
+    "computer graphics":   ["G06T"],
+    "vision":              ["G06V"],
+    "computer vision":     ["G06V"],
+    "pattern recognition": ["G06V", "G06K"],
+    "speech":              ["G10L"],
+    "audio":               ["G10L"],
+    "acoustics":           ["G10K"],
+    "natural language":    ["G06F"],
+    "nlp":                 ["G06F"],
+    "telecom":             ["H04L", "H04W"],
+    "telecommunications":  ["H04L", "H04W"],
+    "networking":          ["H04L"],
+    "wireless":            ["H04W"],
+    "5g":                  ["H04W", "H04L"],
+    "control":             ["G05B"],
+    "control systems":     ["G05B"],
+    "robotics":            ["B25J", "G05B"],
+    "automation":          ["G05B"],
+    "medical":             ["A61B", "A61K"],
+    "medical imaging":     ["A61B", "G06T"],
+    "medical technology":  ["A61B"],
+    "pharmaceutical":      ["A61K"],
+    "measurement":         ["G01"],
+    "sensors":             ["G01"],
+    "metrology":           ["G01B"],
+    "mechanical":          ["F16"],
+    "mechanical engineering": ["F16"],
+    "engines":             ["F01", "F02", "F03", "F04"],
+    "vehicles":            ["B60"],
+    "autonomous vehicles": ["B60W", "G05D"],
+    "manufacturing":       ["B23"],
+    "3d printing":         ["B33Y", "B29C"],
+    "chemistry":           ["C01", "C02", "C07", "C08", "C09", "C10", "C12"],
+    "biotechnology":       ["C12N", "C12Q"],
+    "semiconductors":      ["H01L"],
+    "circuits":            ["H01L", "H03"],
+    "power":               ["H02", "H01"],
+    "energy":              ["H02", "F03"]
+  },
+
+  "invalid_patterns": {
+    "ai": [
+      ["G06F2207", 0.1],
+      ["G06F7",    0.1],
+      ["G10K",     0.1],
+      ["G06T",     0.2],
+      ["G06V",     0.2]
+    ],
+    "image": [
+      ["G06N", 0.2],
+      ["G10L", 0.1]
+    ],
+    "speech": [
+      ["G06T", 0.1],
+      ["G06V", 0.1]
+    ],
+    "telecom": [
+      ["G06T", 0.1],
+      ["G10L", 0.1],
+      ["A61",  0.1]
+    ],
+    "mechanical": [
+      ["G06N", 0.1],
+      ["G06T", 0.1],
+      ["H04L", 0.1]
+    ]
+  },
+
+  "visual_families": ["G06T", "G06V", "G06K"],
+
+  "cross_ref_pattern": "^[A-Z]\\d{2}[A-Z]\\d{4}/",
+
+  "pillar_roles": {
+    "pillar1": "primary_goal",
+    "pillar2": "ai_methodology",
+    "pillar3": "domain_context"
+  }
+}

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables (never commit the real .env)
+.env
+
+# Phase output files (generated at runtime)
+phase*/output/*.json
+phase*/output/*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp

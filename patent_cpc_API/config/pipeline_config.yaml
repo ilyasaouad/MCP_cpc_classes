@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────
+# pipeline_config.yaml — Universal pipeline settings
+# Consumed by core/engine.py at startup. Change values here without
+# touching any phase code.
+# ─────────────────────────────────────────────────────────────────────
+
+phase1a_extraction:
+  min_terms: 10
+  max_terms: 15
+  min_importance_threshold: 3      # drop terms below this importance score
+
+phase1b_audit:
+  min_claim_signal_count: 1        # signals needed to keep a CPC family
+  kill_log_hard_block: true        # rejected families cannot re-enter
+
+phase1c_character:
+  tcr_software_threshold: 0.3      # TCR > 0.3 → bias toward software CPC families
+  tcr_hardware_threshold: -0.3     # TCR < -0.3 → bias toward hardware CPC families
+
+phase2a_routing:
+  top_k_families: 5
+  embedding_weight: 0.45
+  kg_weight: 0.35
+  anchor_weight: 0.20
+  embedding_model: "all-mpnet-base-v2"
+
+phase2b_expansion:
+  max_subgroups: 500
+  min_expansion_count: 5
+  min_subclass_score: 0.30
+  max_traversal_depth: 3
+  proportional_cap: true           # cap slots proportionally to Phase 2A score
+
+phase2c_scoring:
+  rrf_k: 60                        # Reciprocal Rank Fusion constant
+  family_normalization: true       # rescale each family's best = Phase 2A weight
+
+phase2d_filter:
+  top_n: 50                        # keep top N candidates after Phase 2C
+
+phase3a_constraints:
+  domain_confidence_threshold: 0.6 # minimum to apply domain dominance rules
+
+phase3b_validation:
+  domain_anchor_boost: 1.2         # multiplier when domain signals confirmed
+  domain_anchor_penalty: 0.5       # multiplier when signals below threshold
+  anti_collapse_boost: 2.0         # multiplier when domain context present
+  anti_collapse_penalty: 0.05      # multiplier when domain context absent
+
+phase4a_consolidation:
+  max_hypotheses: 3
+  min_support_weight: 0.10         # cluster must hold ≥10% of candidates
+
+phase4b_resolution:
+  phase4_weight: 0.5
+  functional_alignment_weight: 0.3
+  technical_coverage_weight: 0.2
+  high_confidence_threshold: 0.75
+  secondary_gap_threshold: 0.25    # accept secondary if gap < this
+
+phase5b_labeling:
+  # llm_model: "claude-opus-4-7"   # NOT used yet — model comes from .env LLM_MODEL
+                                    # Uncomment and wire into Phase5BLabeler to override
+                                    # per-phase (e.g. force Opus here, use smaller model elsewhere)
+  llm_max_tokens: 600
