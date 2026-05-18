@@ -14,7 +14,12 @@ KEY DESIGN:
 """
 
 import logging
+import re
 from typing import Dict, List, Any, Optional
+
+# Matches CPC cross-reference / indexing codes that embed a 4-digit year, e.g. G10L2015/0631.
+# These are not allocatable subgroups and must be excluded from champion selection.
+_CROSS_REF_PATTERN = re.compile(r'^[A-Z]\d{2}[A-Z]\d{4}/')
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +70,20 @@ def _build_pillar_definitions(phase2a_families: List[str]) -> Dict[str, Any]:
     # pillar2: always G06N if present, else first family
     p2_families = [METHOD_FAMILY] if METHOD_FAMILY in phase2a_families else [primary]
 
-    # pillar3: remaining families (exclude primary and method)
-    p3_families = others if others else [f for f in phase2a_families if f not in p1_families + p2_families]
+    # Families whose domain clearly contradicts a speech/audio primary family (G10L).
+    # G06T (image/video) and G06V (computer vision) are visual-domain families that
+    # should not appear as the Application facet when the primary is acoustic/speech.
+    _VISUAL_FAMILIES = {"G06T", "G06V", "G06K"}
+    primary_is_speech = primary.startswith("G10L")
+    p3_candidates = [
+        f for f in others
+        if not (primary_is_speech and f in _VISUAL_FAMILIES)
+    ]
+
+    # pillar3: remaining families after domain filtering.
+    # Fallback to primary family rather than re-including blocked families —
+    # the original else branch was re-adding G06T for speech patents.
+    p3_families = p3_candidates if p3_candidates else p1_families
 
     return {
         "pillar1_goal": {
@@ -130,10 +147,19 @@ class CPCHypothesisResolver:
 
         logger.info("Phase 5: Resolving %d hypotheses", len(hypotheses))
 
+        # Build symbol→title lookup from the raw candidate pool so _score_hypothesis
+        # can access real CPC titles even though supporting_codes stores only strings.
+        symbol_to_title: Dict[str, str] = {}
+        for c in (all_raw_candidates or []):
+            sym = c.get("symbol", "")
+            title = c.get("title", "") or c.get("full_context", "")
+            if sym and title:
+                symbol_to_title[sym] = title
+
         # Step 1: Score each hypothesis
         scored_hypotheses = []
         for hyp in hypotheses:
-            scores = self._score_hypothesis(hyp, phase1_data)
+            scores = self._score_hypothesis(hyp, phase1_data, symbol_to_title)
             scored_hypotheses.append({**hyp, **scores})
 
         # Step 2: Rank by final_score
@@ -245,15 +271,20 @@ class CPCHypothesisResolver:
             phase2a_families,
         )
 
+        used_symbols: set = set()
         for pillar_key, pillar_def in pillar_defs.items():
             families = pillar_def["families"]
             label = pillar_def["label"]
             desc = pillar_def["description"]
 
-            # Scan raw candidates for matching family prefix
-            champion = self._find_champion_in_pool(all_raw_candidates, families)
+            # Scan raw candidates — exclude symbols already claimed by earlier pillars
+            # so Primary and Application facets don't return the same subgroup.
+            champion = self._find_champion_in_pool(
+                all_raw_candidates, families, exclude=used_symbols
+            )
 
             if champion:
+                used_symbols.add(champion.get("symbol", ""))
                 pillars[pillar_key] = {
                     "symbol": champion.get("symbol", ""),
                     "title": champion.get("title", ""),
@@ -304,15 +335,21 @@ class CPCHypothesisResolver:
     def _find_champion_in_pool(
         candidates: List[Dict[str, Any]],
         families: List[str],
+        exclude: Optional[set] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Find the highest-scoring candidate whose symbol starts with
         any of the given family prefixes.
         """
+        excluded = exclude or set()
         matches = [
             c
             for c in candidates
             if any(c.get("symbol", "").startswith(fam) for fam in families)
+            # Exclude CPC cross-reference/indexing codes (e.g. G10L2015/xxxx) — not allocatable
+            and not _CROSS_REF_PATTERN.match(c.get("symbol", ""))
+            # Exclude symbols already claimed by earlier pillars
+            and c.get("symbol", "") not in excluded
         ]
         if not matches:
             return None
@@ -323,6 +360,7 @@ class CPCHypothesisResolver:
         self,
         hypothesis: Dict[str, Any],
         phase1_data: Dict[str, Any],
+        symbol_to_title: Optional[Dict[str, str]] = None,
     ) -> Dict[str, float]:
         """
         Score a hypothesis against Phase 1 context.
@@ -341,14 +379,22 @@ class CPCHypothesisResolver:
         technical_object = phase1_data.get("technical_object", "").lower()
         system_context = phase1_data.get("system_context", "").lower()
 
-        # Get hypothesis data
         family = hypothesis.get("family", "")
-        candidate_titles = [
-            c.get("title", "").lower()
-            for c in hypothesis.get("supporting_codes", [])
-            if isinstance(c, dict)
-        ]
-        # If supporting_codes are strings, we don't have titles
+
+        # Build title text from supporting_codes.
+        # Codes are stored as plain strings — look up real CPC titles from the
+        # symbol_to_title map built from the raw Phase 2C candidate pool.
+        supporting_codes = hypothesis.get("supporting_codes", [])
+        candidate_titles = []
+        for code in supporting_codes:
+            if isinstance(code, dict):
+                t = code.get("title", "")
+            else:
+                t = (symbol_to_title or {}).get(str(code), "")
+            if t:
+                candidate_titles.append(t.lower())
+
+        # Fallback to reasoning text if no titles found (sparse KG)
         if not candidate_titles:
             candidate_titles = [hypothesis.get("reasoning", "").lower()]
 
@@ -398,38 +444,18 @@ class CPCHypothesisResolver:
 
         Uses keyword overlap between Phase 1 function and CPC titles.
         """
-        function_words = set(core_function.split()) | set(technical_object.split())
-        title_words = set(titles.split())
+        # Use regex to extract clean alpha words — avoids punctuation like "speech," ≠ "speech"
+        function_words = set(re.findall(r'[a-zA-Z]+', (core_function + " " + technical_object).lower()))
+        title_words = set(re.findall(r'[a-zA-Z]+', titles.lower()))
 
         if not function_words or not title_words:
             return 0.5
 
         # Filter to meaningful words
         stopwords = {
-            "the",
-            "a",
-            "an",
-            "of",
-            "for",
-            "and",
-            "or",
-            "in",
-            "on",
-            "to",
-            "with",
-            "by",
-            "from",
-            "as",
-            "is",
-            "are",
-            "be",
-            "being",
-            "been",
-            "method",
-            "apparatus",
-            "system",
-            "device",
-            "comprising",
+            "the", "a", "an", "of", "for", "and", "or", "in", "on", "to",
+            "with", "by", "from", "as", "is", "are", "be", "being", "been",
+            "method", "apparatus", "system", "device", "comprising",
         }
         function_keywords = {
             w for w in function_words if len(w) > 3 and w not in stopwords
@@ -469,7 +495,16 @@ class CPCHypothesisResolver:
             if term and len(term) > 2:
                 total_weight += weight
                 if term in title_lower:
+                    # Exact phrase match — full credit
                     matched += weight
+                elif " " in term:
+                    # Multi-word term: give partial credit proportional to
+                    # how many of its words appear individually in the titles.
+                    # E.g. "feature extraction" → "feature" + "extraction" both in titles → 0.7×
+                    term_words = [w for w in term.split() if len(w) > 2]
+                    if term_words:
+                        hits = sum(1 for w in term_words if w in title_lower)
+                        matched += weight * (hits / len(term_words)) * 0.7
 
         if total_weight == 0:
             return 0.5

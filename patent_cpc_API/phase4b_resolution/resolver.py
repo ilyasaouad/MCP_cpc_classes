@@ -1,19 +1,24 @@
-﻿"""
-phase4b_resolution/resolver.py â€” Phase 4B: Hypothesis Resolution.
+"""
+phase4b_resolution/resolver.py — Phase 4B: Hypothesis Resolution.
 
 Scores each Phase 4A hypothesis on three dimensions and picks the winner:
-  - phase4_weight        (0.5) â€” cluster coherence and support from Phase 4A
-  - functional_alignment (0.3) â€” how well the CPC title matches core_function
-  - technical_coverage   (0.2) â€” how many Phase 1A terms appear in CPC titles
+  - functional_alignment: how well the CPC title matches core_function
+  - technical_coverage:   how many Phase 1A terms appear in CPC titles
+  - specificity_match:    hypothesis coherence from Phase 4A
 
-Final score = 0.5Ã—phase4 + 0.3Ã—functional_alignment + 0.2Ã—technical_coverage
-
-Also resolves the Tri-Pillar output:
-  - Pillar 1 (primary_goal):    best subgroup within the winning family
-  - Pillar 2 (ai_methodology):  best G06N subgroup from the pool
-  - Pillar 3 (domain_context):  best remaining non-visual subgroup
+Tri-Pillar back-scan finds the best subgroup champion for each role.
 
 Old equivalent: CPCHypothesisResolver in patent_cpc_fastapi/cpc_hypothesis_resolver.py
+
+resolve() signature: (phase4_result, phase1_data, all_raw_candidates=None)
+  phase4_result  = state.phase4a["consolidation_details"]  (has "phase4_hypotheses" key)
+  Returns:
+    {
+      "primary":   {family, final_score, confidence, supporting_codes, ...},
+      "secondary": {same} or absent,
+      "decision_logic": {...},
+      "pillars":   {pillar1_goal, pillar2_method, pillar3_context},
+    }
 """
 
 import logging
@@ -27,14 +32,9 @@ logger = logging.getLogger(__name__)
 
 class Phase4BResolver(BasePhase):
     """
-    Multi-criteria hypothesis scoring and pillar resolution.
+    Multi-criteria hypothesis scoring and Tri-Pillar resolution.
 
-    Config keys used:
-      phase4_weight               (float) weight for cluster evidence
-      functional_alignment_weight (float) weight for CPC title match
-      technical_coverage_weight   (float) weight for term coverage
-      high_confidence_threshold   (float) score above this â†’ HIGH confidence
-      secondary_gap_threshold     (float) accept secondary if gap < this
+    No constructor config keys — resolver uses its own internal weights.
     """
 
     def run(self, state: PipelineState) -> Dict[str, Any]:
@@ -46,56 +46,52 @@ class Phase4BResolver(BasePhase):
             state.record_error("4b", f"Import failed: {exc}")
             return {}
 
-        hypotheses: List[Dict[str, Any]] = state.phase4a.get("hypotheses", [])
+        # resolve() needs the full Phase 4A consolidation dict (has "phase4_hypotheses")
+        phase4_result: Dict[str, Any] = state.phase4a.get("consolidation_details", {})
         phase1 = state.phase1a
-        phase2a = state.phase2a
         all_raw_candidates: List[Dict[str, Any]] = state.phase2d.get(
             "all_raw_candidates", []
         )
 
-        if not hypotheses:
+        if not phase4_result.get("phase4_hypotheses"):
             state.record_warning("4b", "No hypotheses from Phase 4A")
             return {}
 
-        # Build symbolâ†’title lookup from full raw pool
-        symbol_to_title: Dict[str, str] = {
-            c.get("symbol", ""): c.get("title", "")
-            for c in all_raw_candidates
-            if c.get("symbol") and c.get("title")
-        }
-
-        p4_w = self.cfg.get("phase4_weight", 0.5)
-        fa_w = self.cfg.get("functional_alignment_weight", 0.3)
-        tc_w = self.cfg.get("technical_coverage_weight", 0.2)
-        hi_thresh = self.cfg.get("high_confidence_threshold", 0.75)
-        gap_thresh = self.cfg.get("secondary_gap_threshold", 0.25)
-
         result: Dict[str, Any] = {}
         try:
-            resolver = CPCHypothesisResolver(
-                phase4_weight=p4_w,
-                functional_alignment_weight=fa_w,
-                technical_coverage_weight=tc_w,
-                high_confidence_threshold=hi_thresh,
-                secondary_gap_threshold=gap_thresh,
-            )
-            result = resolver.resolve(
-                hypotheses,
-                phase1,
-                phase2a,
-                all_raw_candidates,
-                symbol_to_title=symbol_to_title,
-            )
+            resolver = CPCHypothesisResolver(llm_client=self.llm)
+            result = resolver.resolve(phase4_result, phase1, all_raw_candidates)
         except Exception as exc:
             state.record_error("4b", str(exc))
             return {}
 
-        primary = result.get("primary_cpc", "")
-        score = result.get("score", 0.0)
-        conf = result.get("confidence", "LOW")
+        primary = result.get("primary", {})
+        family = primary.get("family", "")
+        supporting = primary.get("supporting_codes", [])
+
+        # Derive a concrete primary symbol: first supporting code, else family itself
+        primary_cpc = supporting[0] if supporting else family
+        confidence = primary.get("confidence", "LOW")
+        score = float(primary.get("final_score", 0.0))
+
+        # Try to look up the title for the primary symbol
+        primary_title = ""
+        for c in all_raw_candidates:
+            if c.get("symbol", "") == primary_cpc:
+                primary_title = c.get("title", "")
+                break
 
         logger.info(
             "Phase 4B: primary=%s score=%.3f confidence=%s",
-            primary, score, conf,
+            primary_cpc, score, confidence,
         )
-        return result
+
+        # Merge resolver result with flat aliases the API router reads
+        return {
+            **result,
+            "primary_cpc": primary_cpc,
+            "primary_title": primary_title,
+            "confidence": confidence,
+            "score": score,
+            "supporting_codes": supporting,
+        }

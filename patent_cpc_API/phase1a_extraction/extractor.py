@@ -29,12 +29,9 @@ class Phase1AExtractor(BasePhase):
 
     def run(self, state: PipelineState) -> Dict[str, Any]:
         try:
-            from cpc_classification.extracting_cpc import (
-                CPCExtractor,
-            )
-            from cpc_classification.pipeline.phase1_runner import (
-                run_phase1,
-            )
+            from cpc_classification.extracting_cpc import CPCExtractor
+            from cpc_classification.pipeline.phase1_runner import run_phase1
+            from cpc_classification.prompts.shared import label_claims
         except ImportError as exc:
             state.record_error("1a", f"Import failed: {exc}")
             return {}
@@ -43,16 +40,25 @@ class Phase1AExtractor(BasePhase):
         claims = state.claims or ""
         description = state.description or ""
 
-        full_text = "\n\n".join(filter(None, [query, claims, description]))
+        # run_phase1 uses description as the main text; query goes into description
+        full_text = "\n\n".join(filter(None, [query, description]))
+
+        # Claims must be labelled with [INDEPENDENT]/[DEPENDENT] markers
+        labeled_claims = label_claims(claims) if claims else ""
 
         min_thresh = self.cfg.get("min_importance_threshold", 3)
 
         try:
-            # run_phase1 expects a classifier-like object with .llm attribute
-            class _FakeCls:
-                llm = self.llm
+            # run_phase1 calls classifier.extractor.extract() — must provide it
+            extractor_instance = CPCExtractor(self.llm)
 
-            result = run_phase1(_FakeCls(), full_text, claims)
+            class _FakeCls:
+                pass
+
+            _FakeCls.llm = self.llm
+            _FakeCls.extractor = extractor_instance
+
+            result = run_phase1(_FakeCls(), full_text, labeled_claims)
         except Exception as exc:
             state.record_error("1a", str(exc))
             return {}

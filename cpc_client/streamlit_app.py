@@ -1609,6 +1609,13 @@ elif phase == "Phase 8: Role Labeling & Report":
         if premier_symbol:
             st.markdown(f"### Main Recommendation: `{premier_symbol}`")
             st.markdown(f"*{premier_title}*")
+            st.caption(
+                "This is the single most specific, legally defensible CPC subgroup for this invention. "
+                "It was selected by the pipeline as the code that best captures the core technical "
+                "contribution — not just the domain, but the exact technical operation being claimed. "
+                "It survived all 7 validation phases: extraction → audit → routing → scoring → "
+                "decision tree → cross-domain validation → hypothesis resolution."
+            )
         else:
             st.warning("No premier classification available.")
     with col_badge:
@@ -1625,7 +1632,14 @@ elif phase == "Phase 8: Role Labeling & Report":
     # ═══════════════════════════════════════════════════════════
     st.markdown("---")
     st.markdown("### 🛠 Technical Breakdown")
-    st.caption("Recommended CPC Classes for this Invention — Role-Based View")
+    st.caption(
+        "Every patent invention has three technical dimensions simultaneously. "
+        "**Primary Goal** = what the invention *produces* (the legally claimed output). "
+        "**AI Methodology** = *how* it works internally (the ML/AI engine behind it). "
+        "**Domain Context** = *where* it applies (the technical environment or field). "
+        "Assigning all three prevents 'domain-blindness' — the error of capturing only one dimension "
+        "and missing the full scope of the invention."
+    )
 
     goal = pillars.get("pillar1_goal", {})
     method = pillars.get("pillar2_method", {})
@@ -1696,6 +1710,51 @@ elif phase == "Phase 8: Role Labeling & Report":
         )
 
     # ═══════════════════════════════════════════════════════════
+    # SUPPORTING CLASSIFICATION DETAILS (Layer Breakdown)
+    # ═══════════════════════════════════════════════════════════
+    if core or support or ctx_codes or coverage:
+        st.markdown("---")
+        st.markdown("### 📊 Supporting Classification Details")
+        st.caption(
+            "These codes describe the invention at three functional layers. "
+            "**Core Invention** = the primary technical operation — what the patent *does* at its heart. "
+            "**Enabling Technology** = supporting components that make the core possible (concatenation rules, phonemic categorisation, etc.). "
+            "**Application Context** = the broader technical domain where the invention is deployed. "
+            "Together these three layers give examiners a complete picture of the invention's scope."
+        )
+        col_core, col_enable, col_ctx = st.columns(3)
+        with col_core:
+            st.markdown("**🔵 Core Invention**")
+            if core:
+                for c in core:
+                    sym = c.get("symbol", "")
+                    title = c.get("title", "N/A")
+                    st.markdown(f"`{sym}`")
+                    st.caption(title)
+            else:
+                st.caption("—")
+        with col_enable:
+            st.markdown("**🟡 Enabling Technology**")
+            if support:
+                for c in support:
+                    sym = c.get("symbol", "")
+                    title = c.get("title", "N/A")
+                    st.markdown(f"`{sym}`")
+                    st.caption(title)
+            else:
+                st.caption("—")
+        with col_ctx:
+            st.markdown("**🟢 Application Context**")
+            if ctx_codes:
+                for c in ctx_codes:
+                    sym = c.get("symbol", "")
+                    title = c.get("title", "N/A")
+                    st.markdown(f"`{sym}`")
+                    st.caption(title)
+            else:
+                st.caption("—")
+
+    # ═══════════════════════════════════════════════════════════
     # PROFESSIONAL JUSTIFICATION
     # ═══════════════════════════════════════════════════════════
     st.markdown("---")
@@ -1713,6 +1772,187 @@ elif phase == "Phase 8: Role Labeling & Report":
                 "of the disclosed invention based on semantic analysis, technical "
                 "weight analysis, and cross-domain validation."
             )
+
+    # ═══════════════════════════════════════════════════════════
+    # METHODS & ALGORITHMS
+    # ═══════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### ⚙️ Methods & Algorithms Used")
+    st.caption(
+        "This classification was produced by a deterministic multi-phase pipeline. "
+        "Only two phases use a Large Language Model (LLM). All other phases are fully "
+        "deterministic — no generative AI, no hallucination risk."
+    )
+
+    pipeline_phases = [
+        {
+            "phase": "Phase 1 — Extraction",
+            "type": "🤖 LLM",
+            "color": "#fff3e0",
+            "border": "#FF9800",
+            "description": (
+                "An LLM reads the raw patent text and extracts: Technical Object (what the device is), "
+                "Core Function (what it does), 10–15 ranked terms by importance, system context, "
+                "evidence table, and negative signals. This is the only phase that interprets free-form text."
+            ),
+        },
+        {
+            "phase": "Phase 1B — Claims Audit",
+            "type": "🤖 LLM",
+            "color": "#fff3e0",
+            "border": "#FF9800",
+            "description": (
+                "An LLM performs forensic analysis of the independent claims, verifying which CPC "
+                "families have genuine claim support. Families with zero claim evidence are added to "
+                "a Kill Log and blocked from entering the search space. This is a hard filter — "
+                "rejected families cannot re-enter downstream."
+            ),
+        },
+        {
+            "phase": "Phase 1C — Technical Character",
+            "type": "📐 Deterministic",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "Computes the Technical Character Ratio (TCR): the density of computational terms "
+                "(neural, embedding, gradient…) vs physical terms (motor, sensor, valve…). "
+                "The ratio biases Phase 2A toward software or hardware CPC families. "
+                "Also assigns role tags (CORE_TECH / SYSTEM / SUPPORT) to each extracted term."
+            ),
+        },
+        {
+            "phase": "Phase 2A — CPC Family Routing",
+            "type": "📐 Deterministic + Embeddings",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "Selects the 3–5 most relevant CPC families using a weighted fusion of three signals: "
+                "0.45 × sentence-transformer embedding similarity (all-mpnet-base-v2), "
+                "0.35 × Knowledge Graph keyword scoring, "
+                "0.20 × anchor signal matching (domain keywords from Phase 1B). "
+                "Families rejected by Phase 1B are hard-blocked before scoring."
+            ),
+        },
+        {
+            "phase": "Phase 2B — Subgroup Expansion",
+            "type": "📐 Deterministic",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "Each selected family is expanded into its full set of CPC subgroups using a "
+                "cascading strategy: KG hierarchy lookup → KG graph BFS traversal (depth 3) → "
+                "XML definition parser fallback. Slot allocation is proportional to Phase 2A relevance "
+                "scores — higher-ranked families receive more expansion slots."
+            ),
+        },
+        {
+            "phase": "Phase 2C — Candidate Scoring",
+            "type": "📐 Deterministic + Embeddings",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "Each subgroup is scored by two independent methods then fused: "
+                "BM25 (term-frequency scoring against CPC titles using Phase 1 terms), "
+                "and semantic embedding similarity (sentence-transformer cosine distance). "
+                "The two rankings are merged using Reciprocal Rank Fusion (RRF, k=60). "
+                "Scores are then family-normalised so each family's best candidate equals its Phase 2A weight."
+            ),
+        },
+        {
+            "phase": "Phase 2D — Score Filter",
+            "type": "📐 Deterministic",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "A simple Top-50 gate: keeps only the 50 highest-scoring candidates from Phase 2C. "
+                "This focuses Phase 3 on a manageable, high-quality candidate set and discards "
+                "low-confidence subgroups that would dilute ranking quality."
+            ),
+        },
+        {
+            "phase": "Phase 3A — Decision Tree Constraints",
+            "type": "📐 Deterministic",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "A 44-rule deterministic decision tree enforces domain correctness. Steps: "
+                "(1) domain detection (SPEECH / IMAGE / CONTROL / …), "
+                "(2) domain dominance boosting (×1.2–×2.0 for matching families), "
+                "(3) functional verb filtering (penalises codes that match nouns but not verbs), "
+                "(4) hierarchy priority (prefers specific subgroups over broad classes), "
+                "(5) invalid-class filtering (removes non-allocatable nodes like family-level symbols without '/')."
+            ),
+        },
+        {
+            "phase": "Phase 3B — Cross-Domain Validation",
+            "type": "📐 Deterministic",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "Two-step domain anchor check: "
+                "DOMAIN_ANCHOR (counts required domain signals in patent text — G10L needs ≥2 of: "
+                "speech, audio, voice, acoustic, utterance… → ×1.2 reward or ×0.5 penalty), "
+                "then ANTI_COLLAPSE (binary gate — if any context word present → ×2.0 boost, "
+                "if absent → ×0.05 near-elimination). Scores are renormalised after both steps."
+            ),
+        },
+        {
+            "phase": "Phase 4 — Hypothesis Consolidation",
+            "type": "📐 Deterministic",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "Groups Phase 3 candidates into hypotheses by CPC family using Jaccard similarity "
+                "clustering. For each cluster, computes: mean score, coherence (average pairwise "
+                "Jaccard between subgroup titles), and support weight (fraction of total candidates). "
+                "Outputs PRIMARY hypothesis and optional SECONDARY if a second family is competitive."
+            ),
+        },
+        {
+            "phase": "Phase 5 — Hypothesis Resolution + Tri-Pillar",
+            "type": "📐 Deterministic",
+            "color": "#e8f4fd",
+            "border": "#2196F3",
+            "description": (
+                "Scores each hypothesis with: "
+                "0.5 × Phase 4 score + 0.3 × functional alignment (keyword overlap between "
+                "Phase 1 core function and CPC titles) + 0.2 × technical coverage (Phase 1 terms "
+                "found in CPC titles). Also runs Tri-Pillar back-scan: searches the full Phase 2C pool "
+                "for the best champion per role — Primary Goal (highest scorer in primary family), "
+                "Methodological (best G06N subgroup), Application Context (next best in primary family)."
+            ),
+        },
+        {
+            "phase": "Phase 8 — Role Labeling & Report",
+            "type": "🤖 LLM (justification only)",
+            "color": "#fff3e0",
+            "border": "#FF9800",
+            "description": (
+                "Deterministic role labeling assigns each surviving CPC code to a functional layer: "
+                "Core Invention (directly addresses the claim), Enabling Technology (makes the core possible), "
+                "Application Context (deployment domain), Legal Coverage (broad protective codes). "
+                "The Professional Justification paragraph is then generated by an LLM that receives "
+                "structured pipeline data — not free-form text — so the output is grounded and verifiable."
+            ),
+        },
+    ]
+
+    for p in pipeline_phases:
+        bg = p["color"]
+        border = p["border"]
+        phase_label = p["phase"]
+        method_type = p["type"]
+        desc = p["description"]
+        st.markdown(
+            f"<div style='background:{bg};border-left:4px solid {border};"
+            f"padding:10px 14px;border-radius:6px;margin-bottom:8px;'>"
+            f"<strong>{phase_label}</strong> &nbsp;&nbsp;"
+            f"<span style='background:{border};color:white;padding:2px 8px;"
+            f"border-radius:12px;font-size:0.78em;'>{method_type}</span><br>"
+            f"<span style='font-size:0.9em;'>{desc}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
     # ═══════════════════════════════════════════════════════════
     # ANALYSIS & LOGIC (Collapsible Tabs)
@@ -1744,18 +1984,31 @@ elif phase == "Phase 8: Role Labeling & Report":
     # Tab 2: Expert Analysis — Confidence
     if premier_conf != "high":
         with st.expander("💡 Why not higher confidence?"):
+            phase5_primary = result.get("phase5", {}).get("primary", {})
+            fa = phase5_primary.get("functional_alignment", 0)
+            tc = phase5_primary.get("technical_coverage", 0)
+            fs = phase5_primary.get("final_score", 0)
+            n_hyp = result.get("phase5", {}).get("decision_logic", {}).get("num_hypotheses_evaluated", 1)
+            # Build a data-driven explanation
+            reasons = []
+            if fs < 0.75:
+                reasons.append(f"Final score <strong>{fs:.3f}</strong> is below the high-confidence threshold of <strong>0.75</strong>.")
+            if tc < 0.3:
+                reasons.append(f"Technical Coverage is <strong>{tc:.3f}</strong> — Phase 1 terms have limited verbatim overlap with CPC title vocabulary (normal for highly specific inventions).")
+            if fa < 0.7:
+                reasons.append(f"Functional Alignment is <strong>{fa:.3f}</strong> — the core function description partially overlaps with CPC subgroup titles.")
+            if n_hyp == 1:
+                reasons.append("Only <strong>1 hypothesis</strong> was formed — the patent is single-domain (G10L). Medium confidence here does <strong>not</strong> indicate ambiguity or a dual-core pattern.")
+            reason_html = "<br>".join(f"• {r}" for r in reasons) if reasons else "Score slightly below the 0.75 threshold."
             st.markdown(
                 "<div style='background-color:#fff3e0;padding:12px;border-radius:8px;"
                 "border-left:4px solid #FF9800;'>"
-                "<em><strong>Expert Analysis — Subclass Discrepancy Detection</strong><br><br>"
-                "This flag is triggered because the invention spans multiple distinct "
-                "high-value CPC domains. The system detected a <strong>'Dual-Core' pattern</strong> — "
-                "the patent's technical contribution bridges two or more major subclasses "
-                "(e.g., G06N Artificial Intelligence vs. G06F Software Engineering).<br><br>"
-                "<strong>What this means:</strong> The AI found credible classifications in "
-                "multiple families. This is <strong>not an error</strong> — it indicates the "
-                "invention is genuinely multi-disciplinary. Human review is advised to choose "
-                "the primary filing target based on the strongest legal claims."
+                f"<em><strong>Score Analysis</strong><br><br>"
+                f"{reason_html}<br><br>"
+                "Formula: <code>0.5 × Phase4Score + 0.3 × FunctionalAlignment + 0.2 × TechnicalCoverage</code><br>"
+                f"= <code>0.5 × 1.0 + 0.3 × {fa:.2f} + 0.2 × {tc:.2f} = {fs:.3f}</code><br><br>"
+                "This is <strong>not an error</strong>. The classification is correct — "
+                "confidence reflects scoring completeness, not domain uncertainty."
                 "</em></div>",
                 unsafe_allow_html=True,
             )

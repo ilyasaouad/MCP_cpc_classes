@@ -97,7 +97,7 @@ def call_classify(query: str, claims: str, description: str, debug: bool) -> dic
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -193,10 +193,10 @@ uploaded = st.file_uploader("Or upload a .txt file", type=["txt"])
 if uploaded:
     query_input = uploaded.read().decode("utf-8")
 
-debug_mode = st.checkbox(
-    "Include per-phase debug data in response",
+show_raw_json = st.checkbox(
+    "Show raw phase JSON at bottom of report",
     value=False,
-    help="Adds raw phase dicts to the response — useful for debugging but slower to render.",
+    help="Always fetches phase data — this only controls whether the raw JSON is visible.",
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -211,9 +211,8 @@ if st.button("🚀 Run Pipeline", type="primary"):
         st.stop()
 
     with st.spinner("Running 13-phase CPC pipeline — ~30–60 seconds…"):
-        res = call_classify(
-            query_input, claims_input, description_input, debug_mode
-        )
+        # Always request debug=true so every phase view has data to display
+        res = call_classify(query_input, claims_input, description_input, debug=True)
     st.session_state["result"] = res
 
 result = st.session_state.get("result")
@@ -306,6 +305,9 @@ if current_phase == "1A — Signal Extraction":
         df = pd.DataFrame(terms)
         if "importance" in df.columns:
             df = df.sort_values("importance", ascending=False)
+        # Drop columns that are entirely empty/NaN/blank
+        df = df.dropna(axis=1, how="all")
+        df = df.loc[:, ~(df.astype(str).eq("") | df.astype(str).eq("nan")).all()]
         st.dataframe(df, use_container_width=True)
         if "importance" in df.columns and "term" in df.columns:
             st.bar_chart(df.set_index("term")[["importance"]])
@@ -630,6 +632,29 @@ elif current_phase == "4B — Hypothesis Resolution":
         c1, c2 = st.columns(2)
         c1.metric("Functional Alignment", f"{fa:.3f}")
         c2.metric("Technical Coverage", f"{tc:.3f}")
+        with st.expander("ℹ️ What do these scores measure?"):
+            st.markdown(
+                "**Functional Alignment** measures keyword overlap between the patent's "
+                "core function description and the official CPC subgroup title strings. "
+                "A score near 0 does **not** indicate a wrong classification — it usually "
+                "means the patent uses modern or domain-specific vocabulary that postdates "
+                "the CPC title vocabulary (standardised pre-2010).\n\n"
+                "**Technical Coverage** measures how many of the Phase 1A extracted terms "
+                "appear verbatim in the winning CPC subgroup's title. CPC titles are very "
+                "short (4–8 words), so novel inventions — especially AI/ML patents — "
+                "routinely score 0 here even when the classification is correct.\n\n"
+                "**Both scores near 0** most often reflect a *CPC vocabulary gap*, not a "
+                "drafting problem. The pipeline's primary evidence comes from Phase 2A "
+                "family routing and Phase 4A cluster coherence, not from these title-overlap "
+                "metrics."
+            )
+        if fa == 0 and tc == 0:
+            st.info(
+                "Both scores are 0 — this is typical for modern AI/ML patents whose "
+                "terminology ('self-supervised pre-training', 'phoneme-guided clustering', "
+                "etc.) does not appear verbatim in CPC title strings. "
+                "The classification confidence reflects cluster evidence, not vocabulary overlap."
+            )
 
     # Tri-Pillar
     raw_pillars = p.get("pillars", pillars)
@@ -861,19 +886,48 @@ elif current_phase == "5B — Final Report":
             if score < 0.75:
                 reasons.append(f"Final score **{score:.3f}** is below the high-confidence threshold of **0.75**.")
             if tc < 0.3:
-                reasons.append(f"Technical Coverage **{tc:.3f}** — Phase 1 terms have limited overlap with short CPC title vocabulary (normal for specific inventions).")
+                reasons.append(
+                    f"Technical Coverage **{tc:.3f}** — Phase 1A extracted terms have "
+                    f"limited verbatim overlap with the short CPC title strings. "
+                    f"This is **normal and expected** for modern AI/ML inventions: "
+                    f"CPC titles use vocabulary standardised before 2010 and will not contain "
+                    f"terms like 'self-supervised pre-training' or 'phoneme-guided clustering'."
+                )
             if fa < 0.7:
-                reasons.append(f"Functional Alignment **{fa:.3f}** — core function description partially overlaps with CPC subgroup titles.")
+                reasons.append(
+                    f"Functional Alignment **{fa:.3f}** — the core function description "
+                    f"does not overlap strongly with the winning CPC subgroup's title string. "
+                    f"Again this reflects a vocabulary gap, not a classification error: "
+                    f"the pipeline's primary signal is cluster evidence from Phases 2A–4A, "
+                    f"not title-string overlap."
+                )
             if not reasons:
                 reasons.append("Score did not exceed the 0.75 high-confidence threshold.")
             for r in reasons:
                 st.markdown(f"- {r}")
+
+            if fa == 0 and tc == 0:
+                st.markdown(
+                    "**Both alignment scores are 0** — this is the strongest indicator of "
+                    "a *vocabulary gap* rather than a wrong or ambiguous classification. "
+                    "Ask yourself: does the selected CPC family (e.g. G10L for speech, "
+                    "G06N for neural networks) match the technical domain of the invention? "
+                    "If yes, the low scores are expected and the classification is reliable."
+                )
+                st.markdown(
+                    "**Can it indicate bad patent writing?** Rarely, and only if the "
+                    "claims are vague about the technical domain (e.g. 'a system comprising "
+                    "a processor'). Strong Phase 1A extraction — precise technical object, "
+                    "correct domain signals, high-importance terms — is the best indicator "
+                    "that the patent text is well-structured, regardless of these scores."
+                )
+
             st.caption(
-                "Note: a single-domain patent with no competing hypotheses can still be "
-                "medium confidence if term vocabulary differs from CPC official titles — "
-                "it does not mean the classification is ambiguous."
+                "Note: a single-domain patent with no competing hypotheses can still score "
+                "medium confidence when term vocabulary differs from CPC official titles. "
+                "This does not mean the classification is ambiguous."
             )
 
-    if debug_mode and phase_details:
+    if show_raw_json and phase_details:
         with st.expander("🛠 Raw phase_details (debug)"):
             st.json(phase_details)

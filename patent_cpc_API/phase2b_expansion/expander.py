@@ -1,5 +1,5 @@
-﻿"""
-phase2b_expansion/expander.py â€” Phase 2B: Subgroup Expansion.
+"""
+phase2b_expansion/expander.py — Phase 2B: Subgroup Expansion.
 
 For each top family from Phase 2A, expands into candidate subgroups via:
   1. KG hierarchy traversal (BFS from the family root)
@@ -8,6 +8,19 @@ For each top family from Phase 2A, expands into candidate subgroups via:
 Non-allocatable nodes (no "/" in symbol, cross-ref codes) are filtered here.
 
 Old equivalent: Phase2BExpander in patent_cpc_fastapi/pipeline/phase2b_expander.py
+
+expand() signature: (families, family_scores=None, phase1=None, max_subgroups=500)
+expand() returns:
+  {
+    "expanded_cpcs": [...],          # bare symbol list
+    "expanded_details": [...],       # [{symbol, title, score, family}, ...]
+    "family_expansions": [...],
+    "source": str,
+    "fallback_used": bool,
+    "family_counts": {family: int},
+    "expansion_balance": {family: int},
+    "pruned_count": int,
+  }
 """
 
 import logging
@@ -25,11 +38,7 @@ class Phase2BExpander(BasePhase):
     KG + XML subgroup expansion with non-allocatable pre-filtering.
 
     Config keys used:
-      max_subgroups       (int)   hard cap on subgroups per family
-      min_expansion_count (int)   minimum subgroups before fallback
-      min_subclass_score  (float) drop subgroups below this base score
-      max_traversal_depth (int)   BFS depth in KG hierarchy
-      proportional_cap    (bool)  cap slots proportionally to Phase 2A weight
+      max_subgroups  (int)  hard cap on total subgroups returned
     """
 
     def run(self, state: PipelineState) -> Dict[str, Any]:
@@ -51,27 +60,24 @@ class Phase2BExpander(BasePhase):
             return {"expanded_candidates": []}
 
         max_sg = self.cfg.get("max_subgroups", 500)
-        min_exp = self.cfg.get("min_expansion_count", 5)
-        min_score = self.cfg.get("min_subclass_score", 0.30)
-        max_depth = self.cfg.get("max_traversal_depth", 3)
-        prop_cap = self.cfg.get("proportional_cap", True)
 
         try:
             expander = _Expander(
-                kg=self.kg,
+                knowledge_graph=self.kg,
                 xml_parser=self.xml_parser,
-                max_subgroups=max_sg,
-                min_expansion_count=min_exp,
-                min_subclass_score=min_score,
-                max_traversal_depth=max_depth,
-                proportional_cap=prop_cap,
             )
-            candidates: List[Dict[str, Any]] = expander.expand(
-                top_families, phase1, family_scores
+            result = expander.expand(
+                top_families,
+                family_scores=family_scores,
+                phase1=phase1,
+                max_subgroups=max_sg,
             )
         except Exception as exc:
             state.record_error("2b", str(exc))
             return {"expanded_candidates": []}
+
+        # expanded_details has the full {symbol, title, score, family} dicts
+        candidates: List[Dict[str, Any]] = result.get("expanded_details", [])
 
         # Filter non-allocatable immediately after expansion
         before = len(candidates)
@@ -80,5 +86,13 @@ class Phase2BExpander(BasePhase):
         if removed:
             logger.info("Phase 2B: removed %d non-allocatable nodes", removed)
 
-        logger.info("Phase 2B: %d subgroup candidates across %d families", len(candidates), len(top_families))
-        return {"expanded_candidates": candidates}
+        logger.info(
+            "Phase 2B: %d subgroup candidates across %d families (source=%s)",
+            len(candidates),
+            len(top_families),
+            result.get("source", "?"),
+        )
+        return {
+            "expanded_candidates": candidates,
+            "expansion_details": result,
+        }

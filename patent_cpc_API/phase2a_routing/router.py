@@ -47,40 +47,25 @@ class Phase2ARouter(BasePhase):
         tcr_result = state.phase1c.get("tcr_details", {})
 
         top_k = self.cfg.get("top_k_families", 5)
-        emb_w = self.cfg.get("embedding_weight", 0.45)
-        kg_w = self.cfg.get("kg_weight", 0.35)
-        anc_w = self.cfg.get("anchor_weight", 0.20)
-        model = self.cfg.get("embedding_model", "all-mpnet-base-v2")
 
         try:
-            class _FakeCls:
-                kg = self.kg
-                xml_parser = self.xml_parser
-                llm = self.llm
-
-            router = Phase2AV2Router(
-                kg=self.kg,
-                xml_parser=self.xml_parser,
-                embedding_weight=emb_w,
-                kg_weight=kg_w,
-                anchor_weight=anc_w,
-                top_k=top_k,
-            )
-            result = router.route(phase1, phase1b, tcr_result)
+            router = Phase2AV2Router(knowledge_graph=self.kg)
+            result = router.route(phase1, phase15_result=tcr_result, top_k=top_k)
         except Exception as exc:
             state.record_error("2a", str(exc))
             return {}
 
-        family_scores = result.get("family_scores", {})
-        logger.info(
-            "Phase 2A: top families=%s",
-            sorted(family_scores, key=family_scores.get, reverse=True)[:top_k],
-        )
+        # route() returns {"families": [{"family": "G10L", "score": 0.91, ...}], ...}
+        families = result.get("families", [])
+        family_scores = {f["family"]: f["score"] for f in families}
+        top_families = result.get("family_names", [f["family"] for f in families])
+
+        logger.info("Phase 2A: top families=%s", top_families[:top_k])
 
         return {
             "family_scores": family_scores,
-            "top_families": result.get("top_families", []),
-            "layer_result": result.get("layer_result", {}),
-            "domain_confidence": result.get("domain_confidence", 0.0),
+            "top_families": top_families,
+            "layer_result": {},
+            "domain_confidence": families[0]["score"] if families else 0.0,
             "routing_details": result,
         }

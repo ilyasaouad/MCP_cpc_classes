@@ -48,12 +48,7 @@ class Phase3BValidator(BasePhase):
 
         result: Dict[str, Any] = {}
         try:
-            validator = CrossDomainValidator(
-                domain_anchor_boost=self.cfg.get("domain_anchor_boost", 1.2),
-                domain_anchor_penalty=self.cfg.get("domain_anchor_penalty", 0.5),
-                anti_collapse_boost=self.cfg.get("anti_collapse_boost", 2.0),
-                anti_collapse_penalty=self.cfg.get("anti_collapse_penalty", 0.05),
-            )
+            validator = CrossDomainValidator()
             result = validator.validate(candidates, phase1, phase3a_result)
             candidates = result.get("phase36_candidates", candidates)
         except Exception as exc:

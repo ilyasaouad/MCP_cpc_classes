@@ -43,26 +43,32 @@ class Phase4AConsolidator(BasePhase):
 
         candidates: List[Dict[str, Any]] = state.phase3b.get("candidates", [])
         phase1 = state.phase1a
-        phase3a_result = state.phase3a.get("constraint_details", {})
 
         max_hyp = self.cfg.get("max_hypotheses", 3)
-        min_sup = self.cfg.get("min_support_weight", 0.10)
+
+        # Build term_importance from Phase 1A terms — required by consolidate()
+        term_importance: Dict[str, float] = {}
+        for t in phase1.get("terms", phase1.get("essential_terms", [])):
+            if isinstance(t, dict):
+                term = t.get("term", "").lower()
+                imp = t.get("importance", 5)
+                if term:
+                    term_importance[term] = max(term_importance.get(term, 0), float(imp))
+            else:
+                term = str(t).lower()
+                if term:
+                    term_importance[term] = 5.0
 
         result: Dict[str, Any] = {}
         try:
-            consolidator = CPCHypothesisConsolidator()
-            result = consolidator.consolidate(
-                candidates,
-                phase1,
-                phase3a_result,
-                max_hypotheses=max_hyp,
-                min_support_weight=min_sup,
-            )
+            consolidator = CPCHypothesisConsolidator(max_hypotheses=max_hyp)
+            result = consolidator.consolidate(candidates, term_importance)
         except Exception as exc:
             state.record_error("4a", str(exc))
             return {}
 
-        hypotheses: List[Dict[str, Any]] = result.get("hypotheses", [])
+        # consolidate() returns keys prefixed with "phase4_"
+        hypotheses: List[Dict[str, Any]] = result.get("phase4_hypotheses", [])
         logger.info("Phase 4A: %d hypotheses consolidated", len(hypotheses))
         return {
             "hypotheses": hypotheses,
